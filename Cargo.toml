@@ -1,0 +1,30 @@
+[package]
+name = "pumpswap_bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sol-trade-sdk = "4.0.3"
+solana-sdk = "2.0.2"
+solana-client = "2.0.2"
+solana-account-decoder = "2.0.2"
+solana-program = "2.0.2"
+spl-associated-token-account = "2.4.1"
+spl-token = "4.0.0"
+
+tokio = { version = "1.43.0", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3"
+async-trait = "0.1"
+log = "0.4"
+env_logger = "0.11"
+url = "2.5"
+chrono = "0.4"
+
+yellowstone-grpc-proto = { version = "5.0.0", features = ["tonic"] }
+tonic = "0.12"
+prost = "0.13"

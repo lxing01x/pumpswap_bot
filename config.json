@@ -1,0 +1,10 @@
+{
+    "grpc_url": "https://mainnet.helius-rpc.com",
+    "rpc_url": "https://mainnet.helius-rpc.com/?api-key=your_api_key",
+    "grpc_token": "your_grpc_token_here",
+    "private_key": "your_base58_private_key_here",
+    "target_mint": "your_target_mint_address_here",
+    "buy_amount_sol": 0.01,
+    "hold_seconds": 10,
+    "slippage_bps": 500
+}
