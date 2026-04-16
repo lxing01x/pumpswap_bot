@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::Keypair,
-    commitment_config::CommitmentConfig,
-};
+use solana_commitment_config::CommitmentConfig;
+use solana_hash::Hash;
+use solana_keypair::Keypair;
+use solana_keypair::Signer;
+use solana_sdk::pubkey::Pubkey;
 use sol_trade_sdk::{
     TradingClient,
-    TradeConfig,
-    SwqosConfig,
-    GasFeeStrategy,
+    common::types::TradeConfig,
+    swqos::SwqosConfig,
+    common::gas_fee_strategy::GasFeeStrategy,
+    trading::factory::DexType,
     TradeBuyParams,
     TradeSellParams,
-    DexType,
     TradeTokenType,
     trading::core::params::{DexParamEnum, PumpSwapParams},
 };
@@ -60,12 +60,13 @@ impl Trader {
             0.001, 0.001
         );
 
-        let recent_blockhash = self.client.get_latest_blockhash().await
+        let recent_blockhash = self.get_latest_blockhash().await
             .context("Failed to get recent blockhash")?;
 
+        let mint_bytes = mint.to_bytes();
         let pumpswap_params = PumpSwapParams::from_mint_by_rpc(
-            &self.client.get_rpc_client(),
-            mint,
+            self.client.get_rpc(),
+            &mint_bytes.into(),
         )
         .await
         .context("Failed to get PumpSwap params from mint")?;
@@ -73,13 +74,13 @@ impl Trader {
         let buy_params = TradeBuyParams {
             dex_type: DexType::PumpSwap,
             input_token_type: TradeTokenType::WSOL,
-            mint,
+            mint: mint_bytes.into(),
             input_token_amount: sol_amount,
             slippage_basis_points: Some(self.slippage_bps),
             recent_blockhash: Some(recent_blockhash),
             extension_params: DexParamEnum::PumpSwap(pumpswap_params.clone()),
             address_lookup_table_account: None,
-            wait_transaction_confirmed: true,
+            wait_tx_confirmed: true,
             create_input_token_ata: true,
             close_input_token_ata: true,
             create_mint_ata: true,
@@ -88,19 +89,25 @@ impl Trader {
             gas_fee_strategy: gas_fee_strategy.clone(),
             simulate: false,
             use_exact_sol_amount: Some(true),
+            grpc_recv_us: None,
         };
 
         log::info!("Executing buy transaction...");
         let result = self.client.buy(buy_params).await;
 
         match result {
-            Ok(sig) => {
-                log::info!("Buy transaction successful! Signature: {}", sig);
-                Ok(())
+            Ok((success, sigs, error, _timings)) => {
+                if success {
+                    log::info!("Buy transaction successful! Signatures: {:?}", sigs);
+                    Ok(())
+                } else {
+                    log::error!("Buy transaction failed: {:?}", error);
+                    Err(anyhow::anyhow!("Buy failed: {:?}", error))
+                }
             }
             Err(e) => {
-                log::error!("Buy transaction failed: {}", e);
-                Err(anyhow::anyhow!("Buy failed: {}", e))
+                log::error!("Buy transaction error: {}", e);
+                Err(anyhow::anyhow!("Buy error: {}", e))
             }
         }
     }
@@ -124,12 +131,13 @@ impl Trader {
             0.001, 0.001
         );
 
-        let recent_blockhash = self.client.get_latest_blockhash().await
+        let recent_blockhash = self.get_latest_blockhash().await
             .context("Failed to get recent blockhash")?;
 
+        let mint_bytes = mint.to_bytes();
         let pumpswap_params = PumpSwapParams::from_mint_by_rpc(
-            &self.client.get_rpc_client(),
-            mint,
+            self.client.get_rpc(),
+            &mint_bytes.into(),
         )
         .await
         .context("Failed to get PumpSwap params from mint")?;
@@ -137,13 +145,13 @@ impl Trader {
         let sell_params = TradeSellParams {
             dex_type: DexType::PumpSwap,
             output_token_type: TradeTokenType::WSOL,
-            mint,
+            mint: mint_bytes.into(),
             input_token_amount: token_balance,
             slippage_basis_points: Some(self.slippage_bps),
             recent_blockhash: Some(recent_blockhash),
             extension_params: DexParamEnum::PumpSwap(pumpswap_params.clone()),
             address_lookup_table_account: None,
-            wait_transaction_confirmed: true,
+            wait_tx_confirmed: true,
             create_output_token_ata: true,
             close_output_token_ata: true,
             durable_nonce: None,
@@ -151,31 +159,41 @@ impl Trader {
             gas_fee_strategy: gas_fee_strategy.clone(),
             simulate: false,
             with_tip: false,
+            close_mint_token_ata: true,
+            grpc_recv_us: None,
         };
 
         log::info!("Executing sell transaction...");
         let result = self.client.sell(sell_params).await;
 
         match result {
-            Ok(sig) => {
-                log::info!("Sell transaction successful! Signature: {}", sig);
-                Ok(())
+            Ok((success, sigs, error, _timings)) => {
+                if success {
+                    log::info!("Sell transaction successful! Signatures: {:?}", sigs);
+                    Ok(())
+                } else {
+                    log::error!("Sell transaction failed: {:?}", error);
+                    Err(anyhow::anyhow!("Sell failed: {:?}", error))
+                }
             }
             Err(e) => {
-                log::error!("Sell transaction failed: {}", e);
-                Err(anyhow::anyhow!("Sell failed: {}", e))
+                log::error!("Sell transaction error: {}", e);
+                Err(anyhow::anyhow!("Sell error: {}", e))
             }
         }
     }
 
     async fn get_token_balance(&self, mint: Pubkey) -> Result<u64> {
-        let owner = self.client.payer();
+        let owner = self.client.get_payer();
+        let owner_bytes = owner.pubkey().to_bytes();
+        let mint_bytes = mint.to_bytes();
+        
         let token_account = spl_associated_token_account::get_associated_token_address(
-            owner,
-            &mint,
+            &owner_bytes.into(),
+            &mint_bytes.into(),
         );
 
-        let rpc_client = self.client.get_rpc_client();
+        let rpc_client = self.client.get_rpc();
         
         match rpc_client.get_token_account_balance(&token_account).await {
             Ok(balance) => {
@@ -187,6 +205,15 @@ impl Trader {
                 Ok(0)
             }
         }
+    }
+
+    async fn get_latest_blockhash(&self) -> Result<Hash> {
+        let rpc = self.client.get_rpc();
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .await
+            .context("Failed to get latest blockhash")?;
+        Ok(blockhash)
     }
 
     pub fn client(&self) -> &TradingClient {

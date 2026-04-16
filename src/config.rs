@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use solana_keypair::Keypair;
+use solana_keypair::Signer;
 use solana_sdk::{
     pubkey::Pubkey,
-    signature::Keypair,
-    signer::Signer,
 };
 use std::{fs, str::FromStr};
 
@@ -29,12 +29,14 @@ impl BotConfig {
     }
 
     pub fn get_keypair(&self) -> Result<Keypair> {
-        Keypair::from_base58_string(&self.private_key)
+        Keypair::try_from_base58_string(&self.private_key)
             .map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))
     }
 
     pub fn get_pubkey(&self) -> Result<Pubkey> {
-        Ok(self.get_keypair()?.pubkey())
+        let kp = self.get_keypair()?;
+        let pubkey_bytes = kp.pubkey().to_bytes();
+        Ok(Pubkey::new_from_array(pubkey_bytes))
     }
 
     pub fn get_target_mint(&self) -> Result<Pubkey> {
