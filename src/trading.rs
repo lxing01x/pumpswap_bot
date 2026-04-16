@@ -16,10 +16,13 @@ use sol_trade_sdk::{
     trading::core::params::{DexParamEnum, PumpSwapParams},
 };
 use std::sync::Arc;
+use tokio::time::{sleep, Duration};
 
 pub struct Trader {
     client: TradingClient,
     slippage_bps: u64,
+    max_retries: u32,
+    retry_delay_ms: u64,
 }
 
 impl Trader {
@@ -27,6 +30,16 @@ impl Trader {
         rpc_url: String,
         keypair: Keypair,
         slippage_bps: u64,
+    ) -> Result<Self> {
+        Self::new_with_retry(rpc_url, keypair, slippage_bps, 5, 1000).await
+    }
+
+    pub async fn new_with_retry(
+        rpc_url: String,
+        keypair: Keypair,
+        slippage_bps: u64,
+        max_retries: u32,
+        retry_delay_ms: u64,
     ) -> Result<Self> {
         let commitment = CommitmentConfig::processed();
         
@@ -42,7 +55,62 @@ impl Trader {
         Ok(Self {
             client,
             slippage_bps,
+            max_retries,
+            retry_delay_ms,
         })
+    }
+
+    async fn get_pumpswap_params_with_retry(
+        &self,
+        mint: &Pubkey,
+    ) -> Result<PumpSwapParams> {
+        let mint_bytes = mint.to_bytes();
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for attempt in 0..self.max_retries {
+            log::info!(
+                "Attempt {}/{} to get PumpSwap params for mint: {}",
+                attempt + 1,
+                self.max_retries,
+                mint
+            );
+
+            match PumpSwapParams::from_mint_by_rpc(
+                self.client.get_rpc(),
+                &mint_bytes.into(),
+            )
+            .await
+            {
+                Ok(params) => {
+                    log::info!("Successfully got PumpSwap params on attempt {}", attempt + 1);
+                    return Ok(params);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Attempt {}/{} failed to get PumpSwap params: {}",
+                        attempt + 1,
+                        self.max_retries,
+                        e
+                    );
+                    last_error = Some(anyhow::anyhow!("{}", e));
+
+                    if attempt < self.max_retries - 1 {
+                        let delay = self.retry_delay_ms * (attempt as u64 + 1);
+                        log::info!("Waiting {} ms before next attempt...", delay);
+                        sleep(Duration::from_millis(delay)).await;
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Failed to get PumpSwap params after {} attempts. Last error: {}. \
+            This may happen if: 1) The token hasn't migrated to PumpSwap yet, \
+            2) RPC node is not synced, or 3) The mint address is incorrect. \
+            If the token is still in bonding curve stage, you may need to use PumpFun instead of PumpSwap.",
+            self.max_retries,
+            last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error"))
+        ))
     }
 
     pub async fn buy(
@@ -63,14 +131,9 @@ impl Trader {
         let recent_blockhash = self.get_latest_blockhash().await
             .context("Failed to get recent blockhash")?;
 
-        let mint_bytes = mint.to_bytes();
-        let pumpswap_params = PumpSwapParams::from_mint_by_rpc(
-            self.client.get_rpc(),
-            &mint_bytes.into(),
-        )
-        .await
-        .context("Failed to get PumpSwap params from mint")?;
+        let pumpswap_params = self.get_pumpswap_params_with_retry(&mint).await?;
 
+        let mint_bytes = mint.to_bytes();
         let buy_params = TradeBuyParams {
             dex_type: DexType::PumpSwap,
             input_token_type: TradeTokenType::WSOL,
@@ -134,14 +197,9 @@ impl Trader {
         let recent_blockhash = self.get_latest_blockhash().await
             .context("Failed to get recent blockhash")?;
 
-        let mint_bytes = mint.to_bytes();
-        let pumpswap_params = PumpSwapParams::from_mint_by_rpc(
-            self.client.get_rpc(),
-            &mint_bytes.into(),
-        )
-        .await
-        .context("Failed to get PumpSwap params from mint")?;
+        let pumpswap_params = self.get_pumpswap_params_with_retry(&mint).await?;
 
+        let mint_bytes = mint.to_bytes();
         let sell_params = TradeSellParams {
             dex_type: DexType::PumpSwap,
             output_token_type: TradeTokenType::WSOL,

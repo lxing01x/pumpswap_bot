@@ -17,6 +17,18 @@ pub struct BotConfig {
     pub buy_amount_sol: f64,
     pub hold_seconds: u64,
     pub slippage_bps: u64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+}
+
+fn default_max_retries() -> u32 {
+    5
+}
+
+fn default_retry_delay_ms() -> u64 {
+    1000
 }
 
 impl BotConfig {
