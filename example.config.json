@@ -1,0 +1,10 @@
+{
+    "grpc_url": "gRPC端点URL",
+    "rpc_url": "RPC端点URL",
+    "grpc_token": "gRPC令牌（可选）",
+    "private_key": "您的base58格式私钥",
+    "target_mint": "目标代币mint地址",
+    "buy_amount_sol": 0.01,
+    "hold_seconds": 10,
+    "slippage_bps": 500
+}
