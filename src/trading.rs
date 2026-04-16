@@ -71,12 +71,18 @@ impl Trader {
         address
     }
 
+    fn derive_pool_authority_address(mint: &Pubkey) -> Pubkey {
+        let seeds = &[b"pool-authority", mint.as_ref()];
+        let (address, _bump) = Pubkey::find_program_address(seeds, &PUMP_PROGRAM_ID);
+        address
+    }
+
     fn derive_pumpswap_pool_address(
         creator: &Pubkey,
         base_mint: &Pubkey,
         quote_mint: &Pubkey,
     ) -> Pubkey {
-        let index: u32 = 0;
+        let index: u16 = 0;
         let index_bytes = index.to_le_bytes();
         let seeds: &[&[u8]] = &[
             b"pool",
@@ -99,23 +105,31 @@ impl Trader {
         let bonding_curve = Self::derive_bonding_curve_address(mint);
         log::info!("Derived bonding curve address: {}", bonding_curve);
 
-        log::info!("Deriving pool addresses with different creator candidates...");
+        let pool_authority = Self::derive_pool_authority_address(mint);
+        log::info!("Derived pool-authority address (creator for canonical pool): {}", pool_authority);
+
+        log::info!("Deriving pool addresses...");
         
-        let pool_with_bonding_curve_as_creator = Self::derive_pumpswap_pool_address(
-            &bonding_curve,
+        let pool_with_pool_authority_as_creator = Self::derive_pumpswap_pool_address(
+            &pool_authority,
             mint,
             &WSOL_MINT,
         );
         log::info!(
-            "Pool address (creator = bonding_curve, index = 0): {}",
-            pool_with_bonding_curve_as_creator
+            "Pool address (creator = pool-authority, index = 0): {}",
+            pool_with_pool_authority_as_creator
         );
 
         log::info!("");
-        log::info!("IMPORTANT: Please verify this pool address manually:");
-        log::info!("  1. Check if {} exists on Solana", pool_with_bonding_curve_as_creator);
+        log::info!("IMPORTANT: For canonical PumpSwap pools (created via migrate instruction):");
+        log::info!("  - creator = pool-authority PDA (derived from [b\"pool-authority\", mint])");
+        log::info!("  - index = 0");
+        log::info!("  - base_mint = token mint");
+        log::info!("  - quote_mint = WSOL");
+        log::info!("");
+        log::info!("Please verify this pool address manually:");
+        log::info!("  1. Check if {} exists on Solana", pool_with_pool_authority_as_creator);
         log::info!("  2. Verify it is owned by PumpSwap program ({})", PUMPSWAP_PROGRAM_ID);
-        log::info!("  3. If it exists, the issue may be with SDK's from_mint_by_rpc implementation");
         log::info!("");
 
         log::info!("=== Diagnosis complete ===");
