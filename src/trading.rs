@@ -18,6 +18,11 @@ use sol_trade_sdk::{
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+pub const PUMP_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+pub const PUMPSWAP_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+pub const WSOL_MINT: Pubkey = solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
+pub const CANONICAL_POOL_INDEX: u16 = 0;
+
 pub struct Trader {
     client: TradingClient,
     slippage_bps: u64,
@@ -41,7 +46,7 @@ impl Trader {
         max_retries: u32,
         retry_delay_ms: u64,
     ) -> Result<Self> {
-        let commitment = CommitmentConfig::processed();
+        let commitment = CommitmentConfig::finalized();
         
         let swqos_configs: Vec<SwqosConfig> = vec![
             SwqosConfig::Default(rpc_url.clone()),
@@ -60,10 +65,69 @@ impl Trader {
         })
     }
 
+    fn derive_bonding_curve_address(mint: &Pubkey) -> Pubkey {
+        let seeds = &[b"bonding-curve", mint.as_ref()];
+        let (address, _bump) = Pubkey::find_program_address(seeds, &PUMP_PROGRAM_ID);
+        address
+    }
+
+    fn derive_pumpswap_pool_address(
+        creator: &Pubkey,
+        base_mint: &Pubkey,
+        quote_mint: &Pubkey,
+    ) -> Pubkey {
+        let index: u32 = 0;
+        let index_bytes = index.to_le_bytes();
+        let seeds: &[&[u8]] = &[
+            b"pool",
+            &index_bytes,
+            creator.as_ref(),
+            base_mint.as_ref(),
+            quote_mint.as_ref(),
+        ];
+        let (address, _bump) = Pubkey::find_program_address(seeds, &PUMPSWAP_PROGRAM_ID);
+        address
+    }
+
+    async fn diagnose_pool_address(&self, mint: &Pubkey) -> Result<()> {
+        log::info!("=== Diagnosing PumpSwap pool address ===");
+        log::info!("Mint: {}", mint);
+        log::info!("WSOL Mint: {}", WSOL_MINT);
+        log::info!("Pump Program ID: {}", PUMP_PROGRAM_ID);
+        log::info!("PumpSwap Program ID: {}", PUMPSWAP_PROGRAM_ID);
+
+        let bonding_curve = Self::derive_bonding_curve_address(mint);
+        log::info!("Derived bonding curve address: {}", bonding_curve);
+
+        log::info!("Deriving pool addresses with different creator candidates...");
+        
+        let pool_with_bonding_curve_as_creator = Self::derive_pumpswap_pool_address(
+            &bonding_curve,
+            mint,
+            &WSOL_MINT,
+        );
+        log::info!(
+            "Pool address (creator = bonding_curve, index = 0): {}",
+            pool_with_bonding_curve_as_creator
+        );
+
+        log::info!("");
+        log::info!("IMPORTANT: Please verify this pool address manually:");
+        log::info!("  1. Check if {} exists on Solana", pool_with_bonding_curve_as_creator);
+        log::info!("  2. Verify it is owned by PumpSwap program ({})", PUMPSWAP_PROGRAM_ID);
+        log::info!("  3. If it exists, the issue may be with SDK's from_mint_by_rpc implementation");
+        log::info!("");
+
+        log::info!("=== Diagnosis complete ===");
+        Ok(())
+    }
+
     async fn get_pumpswap_params_with_retry(
         &self,
         mint: &Pubkey,
     ) -> Result<PumpSwapParams> {
+        self.diagnose_pool_address(mint).await?;
+
         let mint_bytes = mint.to_bytes();
         let mut last_error: Option<anyhow::Error> = None;
 
@@ -104,9 +168,13 @@ impl Trader {
         }
 
         Err(anyhow::anyhow!(
-            "Failed to get PumpSwap params after {} attempts. Last error: {}. \
-            This may happen if: 1) The token hasn't migrated to PumpSwap yet, \
-            2) RPC node is not synced, or 3) The mint address is incorrect. \
+            "Failed to get PumpSwap params after {} attempts. Last error: {}. \n\
+            Diagnostic information has been logged above. \n\
+            Possible causes: \n\
+            1) The token hasn't fully migrated to PumpSwap yet (check if bonding curve account still exists) \n\
+            2) RPC node is not fully synced \n\
+            3) The mint address is incorrect \n\
+            4) The SDK's from_mint_by_rpc may be using getProgramAccounts which fails on some RPC nodes \n\
             If the token is still in bonding curve stage, you may need to use PumpFun instead of PumpSwap.",
             self.max_retries,
             last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error"))
