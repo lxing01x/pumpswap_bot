@@ -21,10 +21,12 @@ impl TradingStrategy {
         let keypair = config.get_keypair()?;
         let target_mint = config.get_target_mint()?;
         
-        let trader = Trader::new(
+        let trader = Trader::new_with_retry(
             config.rpc_url.clone(),
             keypair,
             config.slippage_bps,
+            config.max_retries,
+            config.retry_delay_ms,
         )
         .await
         .context("Failed to create Trader instance")?;
@@ -43,6 +45,8 @@ impl TradingStrategy {
         log::info!("Buy amount: {} SOL", self.config.buy_amount_sol);
         log::info!("Hold time: {} seconds", self.config.hold_seconds);
         log::info!("Slippage: {} bps", self.config.slippage_bps);
+        log::info!("Max retries: {}", self.config.max_retries);
+        log::info!("Retry delay: {} ms", self.config.retry_delay_ms);
 
         log::info!("Listening for transactions on mint: {}...", self.target_mint);
         
