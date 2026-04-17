@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 use crate::config::BotConfig;
-use crate::trading::Trader;
+use crate::trading::{Trader, TradeInfo};
 
 pub const PUMPSWAP_PROGRAM_ID: &str = "SwaPpA9LAaLfeMiqDymXsF4U2oZd5fJtQZ48X7GjVfA";
 
@@ -14,6 +15,7 @@ pub struct TradingStrategy {
     trader: Trader,
     target_mint: Pubkey,
     executed: Arc<AtomicBool>,
+    latest_trade_info: Arc<Mutex<Option<TradeInfo>>>,
 }
 
 impl TradingStrategy {
@@ -36,6 +38,7 @@ impl TradingStrategy {
             trader,
             target_mint,
             executed: Arc::new(AtomicBool::new(false)),
+            latest_trade_info: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -59,9 +62,34 @@ impl TradingStrategy {
         log::info!("Starting simple monitoring mode...");
         log::info!("Bot will monitor for any activity and trigger the trade sequence.");
         
+        log::info!("Prefetching TradeInfo for target mint...");
+        let trade_info = self.trader.fetch_trade_info_with_retry(&self.target_mint).await
+            .context("Failed to prefetch TradeInfo")?;
+        
+        log::info!("Successfully prefetched TradeInfo:");
+        log::info!("  Pool: {}", trade_info.pool);
+        log::info!("  Base mint: {}", trade_info.base_mint);
+        log::info!("  Quote mint: {}", trade_info.quote_mint);
+        log::info!("  Pool base token account: {}", trade_info.pool_base_token_account);
+        log::info!("  Pool quote token account: {}", trade_info.pool_quote_token_account);
+        log::info!("  Is cashback coin: {}", trade_info.is_cashback_coin);
+        
+        self.store_latest_trade_info(trade_info.clone());
+        
         self.execute_trade_sequence().await?;
 
         Ok(())
+    }
+
+    fn store_latest_trade_info(&self, trade_info: TradeInfo) {
+        let mut info = self.latest_trade_info.lock().unwrap();
+        *info = Some(trade_info);
+        log::info!("Stored latest TradeInfo for future use");
+    }
+
+    fn get_latest_trade_info(&self) -> Option<TradeInfo> {
+        let info = self.latest_trade_info.lock().unwrap();
+        info.clone()
     }
 
     async fn execute_trade_sequence(&self) -> Result<()> {
@@ -73,8 +101,11 @@ impl TradingStrategy {
         self.executed.store(true, Ordering::Relaxed);
         log::info!("=== Starting trade sequence ===");
 
+        let trade_info = self.get_latest_trade_info()
+            .context("No TradeInfo available. Make sure to prefetch TradeInfo before executing trades.")?;
+
         if let Err(e) = self.trader.buy(
-            self.target_mint,
+            &trade_info,
             self.config.buy_amount_lamports(),
         ).await {
             log::error!("Buy failed: {}", e);
@@ -84,7 +115,7 @@ impl TradingStrategy {
         log::info!("Buy successful. Waiting {} seconds before selling...", self.config.hold_seconds);
         sleep(Duration::from_secs(self.config.hold_seconds)).await;
 
-        if let Err(e) = self.trader.sell(self.target_mint).await {
+        if let Err(e) = self.trader.sell(&trade_info).await {
             log::error!("Sell failed: {}", e);
             return Err(e);
         }

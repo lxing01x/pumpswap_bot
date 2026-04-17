@@ -23,6 +23,84 @@ pub const PUMPSWAP_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("pAMMBay6oceH9fJKBRH
 pub const WSOL_MINT: Pubkey = solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
 pub const CANONICAL_POOL_INDEX: u16 = 0;
 
+pub const MAYHEM_FEE_RECIPIENT_SWAP: Pubkey = solana_sdk::pubkey!("8N3GDaZ2iwN65oxVatKTLPNooAVUJTbfiVJ1ahyqwjSk");
+pub const TOKEN_PROGRAM: Pubkey = solana_sdk::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+pub const TOKEN_PROGRAM_2022: Pubkey = solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+#[derive(Debug, Clone)]
+pub struct TradeInfo {
+    pub pool: Pubkey,
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    pub pool_base_token_account: Pubkey,
+    pub pool_quote_token_account: Pubkey,
+    pub pool_base_token_reserves: u64,
+    pub pool_quote_token_reserves: u64,
+    pub coin_creator_vault_ata: Pubkey,
+    pub coin_creator_vault_authority: Pubkey,
+    pub base_token_program: Pubkey,
+    pub quote_token_program: Pubkey,
+    pub fee_recipient: Pubkey,
+    pub is_cashback_coin: bool,
+    pub is_mayhem_mode: bool,
+}
+
+impl TradeInfo {
+    pub fn from_pumpswap_params(params: &PumpSwapParams) -> Self {
+        let fee_recipient = if params.is_mayhem_mode {
+            MAYHEM_FEE_RECIPIENT_SWAP
+        } else {
+            Pubkey::default()
+        };
+
+        Self {
+            pool: params.pool,
+            base_mint: params.base_mint,
+            quote_mint: params.quote_mint,
+            pool_base_token_account: params.pool_base_token_account,
+            pool_quote_token_account: params.pool_quote_token_account,
+            pool_base_token_reserves: params.pool_base_token_reserves,
+            pool_quote_token_reserves: params.pool_quote_token_reserves,
+            coin_creator_vault_ata: params.coin_creator_vault_ata,
+            coin_creator_vault_authority: params.coin_creator_vault_authority,
+            base_token_program: params.base_token_program,
+            quote_token_program: params.quote_token_program,
+            fee_recipient,
+            is_cashback_coin: params.is_cashback_coin,
+            is_mayhem_mode: params.is_mayhem_mode,
+        }
+    }
+
+    pub fn derive_canonical_pool_address(mint: &Pubkey) -> Pubkey {
+        let pool_authority = Self::derive_pool_authority_address(mint);
+        Self::derive_pumpswap_pool_address(&pool_authority, mint, &WSOL_MINT)
+    }
+
+    fn derive_pool_authority_address(mint: &Pubkey) -> Pubkey {
+        let seeds = &[b"pool-authority", mint.as_ref()];
+        let (address, _bump) = Pubkey::find_program_address(seeds, &PUMP_PROGRAM_ID);
+        address
+    }
+
+    fn derive_pumpswap_pool_address(
+        creator: &Pubkey,
+        base_mint: &Pubkey,
+        quote_mint: &Pubkey,
+    ) -> Pubkey {
+        let index: u16 = 0;
+        let index_bytes = index.to_le_bytes();
+        let seeds: &[&[u8]] = &[
+            b"pool",
+            &index_bytes,
+            creator.as_ref(),
+            base_mint.as_ref(),
+            quote_mint.as_ref(),
+        ];
+        let (address, _bump) = Pubkey::find_program_address(seeds, &PUMPSWAP_PROGRAM_ID);
+        address
+    }
+}
+
 pub struct Trader {
     client: TradingClient,
     slippage_bps: u64,
@@ -136,18 +214,13 @@ impl Trader {
         Ok(())
     }
 
-    async fn derive_canonical_pool_address(&self, mint: &Pubkey) -> Pubkey {
-        let pool_authority = Self::derive_pool_authority_address(mint);
-        Self::derive_pumpswap_pool_address(&pool_authority, mint, &WSOL_MINT)
-    }
-
-    async fn get_pumpswap_params_with_retry(
+    pub async fn fetch_trade_info_with_retry(
         &self,
         mint: &Pubkey,
-    ) -> Result<PumpSwapParams> {
+    ) -> Result<TradeInfo> {
         self.diagnose_pool_address(mint).await?;
 
-        let pool_address = self.derive_canonical_pool_address(mint).await;
+        let pool_address = TradeInfo::derive_canonical_pool_address(mint);
         let pool_address_bytes = pool_address.to_bytes();
         
         log::info!("Derived canonical pool address: {}", pool_address);
@@ -156,7 +229,7 @@ impl Trader {
 
         for attempt in 0..self.max_retries {
             log::info!(
-                "Attempt {}/{} to get PumpSwap params for pool: {}",
+                "Attempt {}/{} to fetch pool data (via from_pool_address_by_rpc) for pool: {}",
                 attempt + 1,
                 self.max_retries,
                 pool_address
@@ -169,12 +242,31 @@ impl Trader {
             .await
             {
                 Ok(params) => {
-                    log::info!("Successfully got PumpSwap params on attempt {}", attempt + 1);
-                    return Ok(params);
+                    log::info!("Successfully fetched pool data on attempt {}", attempt + 1);
+                    
+                    let trade_info = TradeInfo::from_pumpswap_params(&params);
+                    
+                    log::info!("TradeInfo built from pool data:");
+                    log::info!("  Pool: {}", trade_info.pool);
+                    log::info!("  Base mint: {}", trade_info.base_mint);
+                    log::info!("  Quote mint: {}", trade_info.quote_mint);
+                    log::info!("  Pool base token account: {}", trade_info.pool_base_token_account);
+                    log::info!("  Pool quote token account: {}", trade_info.pool_quote_token_account);
+                    log::info!("  Pool base token reserves: {}", trade_info.pool_base_token_reserves);
+                    log::info!("  Pool quote token reserves: {}", trade_info.pool_quote_token_reserves);
+                    log::info!("  Coin creator vault ATA: {}", trade_info.coin_creator_vault_ata);
+                    log::info!("  Coin creator vault authority: {}", trade_info.coin_creator_vault_authority);
+                    log::info!("  Base token program: {}", trade_info.base_token_program);
+                    log::info!("  Quote token program: {}", trade_info.quote_token_program);
+                    log::info!("  Fee recipient: {}", trade_info.fee_recipient);
+                    log::info!("  Is cashback coin: {}", trade_info.is_cashback_coin);
+                    log::info!("  Is mayhem mode: {}", trade_info.is_mayhem_mode);
+                    
+                    return Ok(trade_info);
                 }
                 Err(e) => {
                     log::warn!(
-                        "Attempt {}/{} failed to get PumpSwap params: {}",
+                        "Attempt {}/{} failed to fetch pool data: {}",
                         attempt + 1,
                         self.max_retries,
                         e
@@ -191,8 +283,7 @@ impl Trader {
         }
 
         Err(anyhow::anyhow!(
-            "Failed to get PumpSwap params after {} attempts. Last error: {}. \n\
-            Diagnostic information has been logged above. \n\
+            "Failed to fetch pool data after {} attempts. Last error: {}. \n\
             Pool address used: {} \n\
             Possible causes: \n\
             1) The token hasn't fully migrated to PumpSwap yet (check if bonding curve account still exists) \n\
@@ -205,13 +296,48 @@ impl Trader {
         ))
     }
 
+    fn build_pumpswap_params_from_trade_info(&self, trade_info: &TradeInfo) -> PumpSwapParams {
+        log::info!("Building PumpSwapParams via from_trade (hot path, no RPC):");
+        log::info!("  Pool: {}", trade_info.pool);
+        log::info!("  Base mint: {}", trade_info.base_mint);
+        log::info!("  Quote mint: {}", trade_info.quote_mint);
+        log::info!("  Pool base token account: {}", trade_info.pool_base_token_account);
+        log::info!("  Pool quote token account: {}", trade_info.pool_quote_token_account);
+        log::info!("  Pool base token reserves: {}", trade_info.pool_base_token_reserves);
+        log::info!("  Pool quote token reserves: {}", trade_info.pool_quote_token_reserves);
+        log::info!("  Coin creator vault ATA: {}", trade_info.coin_creator_vault_ata);
+        log::info!("  Coin creator vault authority: {}", trade_info.coin_creator_vault_authority);
+        log::info!("  Base token program: {}", trade_info.base_token_program);
+        log::info!("  Quote token program: {}", trade_info.quote_token_program);
+        log::info!("  Fee recipient: {}", trade_info.fee_recipient);
+        log::info!("  Is cashback coin: {}", trade_info.is_cashback_coin);
+
+        PumpSwapParams::from_trade(
+            trade_info.pool,
+            trade_info.base_mint,
+            trade_info.quote_mint,
+            trade_info.pool_base_token_account,
+            trade_info.pool_quote_token_account,
+            trade_info.pool_base_token_reserves,
+            trade_info.pool_quote_token_reserves,
+            trade_info.coin_creator_vault_ata,
+            trade_info.coin_creator_vault_authority,
+            trade_info.base_token_program,
+            trade_info.quote_token_program,
+            trade_info.fee_recipient,
+            trade_info.is_cashback_coin,
+        )
+    }
+
     pub async fn buy(
         &self,
-        mint: Pubkey,
+        trade_info: &TradeInfo,
         sol_amount: u64,
     ) -> Result<()> {
-        log::info!("Starting buy operation for mint: {}", mint);
+        log::info!("Starting buy operation for mint: {}", trade_info.base_mint);
         log::info!("Buy amount: {} lamports ({:.9} SOL)", sol_amount, sol_amount as f64 / 1_000_000_000.0);
+        log::info!("Using pool: {}", trade_info.pool);
+        log::info!("Is cashback coin: {}", trade_info.is_cashback_coin);
 
         let gas_fee_strategy = GasFeeStrategy::new();
         gas_fee_strategy.set_global_fee_strategy(
@@ -223,9 +349,9 @@ impl Trader {
         let recent_blockhash = self.get_latest_blockhash().await
             .context("Failed to get recent blockhash")?;
 
-        let pumpswap_params = self.get_pumpswap_params_with_retry(&mint).await?;
+        let pumpswap_params = self.build_pumpswap_params_from_trade_info(trade_info);
 
-        let mint_bytes = mint.to_bytes();
+        let mint_bytes = trade_info.base_mint.to_bytes();
         let buy_params = TradeBuyParams {
             dex_type: DexType::PumpSwap,
             input_token_type: TradeTokenType::WSOL,
@@ -269,13 +395,15 @@ impl Trader {
 
     pub async fn sell(
         &self,
-        mint: Pubkey,
+        trade_info: &TradeInfo,
     ) -> Result<()> {
-        log::info!("Starting sell operation for mint: {}", mint);
+        log::info!("Starting sell operation for mint: {}", trade_info.base_mint);
+        log::info!("Using pool: {}", trade_info.pool);
+        log::info!("Is cashback coin: {}", trade_info.is_cashback_coin);
 
-        let token_balance = self.get_token_balance(mint).await?;
+        let token_balance = self.get_token_balance(trade_info.base_mint).await?;
         if token_balance == 0 {
-            return Err(anyhow::anyhow!("No token balance to sell for mint: {}", mint));
+            return Err(anyhow::anyhow!("No token balance to sell for mint: {}", trade_info.base_mint));
         }
         log::info!("Token balance to sell: {}", token_balance);
 
@@ -289,9 +417,9 @@ impl Trader {
         let recent_blockhash = self.get_latest_blockhash().await
             .context("Failed to get recent blockhash")?;
 
-        let pumpswap_params = self.get_pumpswap_params_with_retry(&mint).await?;
+        let pumpswap_params = self.build_pumpswap_params_from_trade_info(trade_info);
 
-        let mint_bytes = mint.to_bytes();
+        let mint_bytes = trade_info.base_mint.to_bytes();
         let sell_params = TradeSellParams {
             dex_type: DexType::PumpSwap,
             output_token_type: TradeTokenType::WSOL,
