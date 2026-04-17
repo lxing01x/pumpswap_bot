@@ -136,26 +136,35 @@ impl Trader {
         Ok(())
     }
 
+    async fn derive_canonical_pool_address(&self, mint: &Pubkey) -> Pubkey {
+        let pool_authority = Self::derive_pool_authority_address(mint);
+        Self::derive_pumpswap_pool_address(&pool_authority, mint, &WSOL_MINT)
+    }
+
     async fn get_pumpswap_params_with_retry(
         &self,
         mint: &Pubkey,
     ) -> Result<PumpSwapParams> {
         self.diagnose_pool_address(mint).await?;
 
-        let mint_bytes = mint.to_bytes();
+        let pool_address = self.derive_canonical_pool_address(mint).await;
+        let pool_address_bytes = pool_address.to_bytes();
+        
+        log::info!("Derived canonical pool address: {}", pool_address);
+
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..self.max_retries {
             log::info!(
-                "Attempt {}/{} to get PumpSwap params for mint: {}",
+                "Attempt {}/{} to get PumpSwap params for pool: {}",
                 attempt + 1,
                 self.max_retries,
-                mint
+                pool_address
             );
 
-            match PumpSwapParams::from_mint_by_rpc(
+            match PumpSwapParams::from_pool_address_by_rpc(
                 self.client.get_rpc(),
-                &mint_bytes.into(),
+                &pool_address_bytes.into(),
             )
             .await
             {
@@ -184,14 +193,15 @@ impl Trader {
         Err(anyhow::anyhow!(
             "Failed to get PumpSwap params after {} attempts. Last error: {}. \n\
             Diagnostic information has been logged above. \n\
+            Pool address used: {} \n\
             Possible causes: \n\
             1) The token hasn't fully migrated to PumpSwap yet (check if bonding curve account still exists) \n\
             2) RPC node is not fully synced \n\
-            3) The mint address is incorrect \n\
-            4) The SDK's from_mint_by_rpc may be using getProgramAccounts which fails on some RPC nodes \n\
+            3) The pool address is incorrect \n\
             If the token is still in bonding curve stage, you may need to use PumpFun instead of PumpSwap.",
             self.max_retries,
-            last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error"))
+            last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error")),
+            pool_address
         ))
     }
 
