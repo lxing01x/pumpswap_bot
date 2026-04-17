@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use solana_address::Address;
 use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
 use solana_keypair::Keypair;
@@ -23,24 +24,32 @@ pub const PUMPSWAP_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("pAMMBay6oceH9fJKBRH
 pub const WSOL_MINT: Pubkey = solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
 pub const CANONICAL_POOL_INDEX: u16 = 0;
 
-pub const MAYHEM_FEE_RECIPIENT_SWAP: Pubkey = solana_sdk::pubkey!("8N3GDaZ2iwN65oxVatKTLPNooAVUJTbfiVJ1ahyqwjSk");
-pub const TOKEN_PROGRAM: Pubkey = solana_sdk::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-pub const TOKEN_PROGRAM_2022: Pubkey = solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+pub const MAYHEM_FEE_RECIPIENT_SWAP: Address = solana_address::address!("8N3GDaZ2iwN65oxVatKTLPNooAVUJTbfiVJ1ahyqwjSk");
+pub const TOKEN_PROGRAM: Address = solana_address::address!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+pub const TOKEN_PROGRAM_2022: Address = solana_address::address!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+fn pubkey_to_address(pubkey: &Pubkey) -> Address {
+    Address::from(pubkey.to_bytes())
+}
+
+fn address_to_pubkey(address: &Address) -> Pubkey {
+    Pubkey::from(address.to_bytes())
+}
 
 #[derive(Debug, Clone)]
 pub struct TradeInfo {
-    pub pool: Pubkey,
-    pub base_mint: Pubkey,
-    pub quote_mint: Pubkey,
-    pub pool_base_token_account: Pubkey,
-    pub pool_quote_token_account: Pubkey,
+    pub pool: Address,
+    pub base_mint: Address,
+    pub quote_mint: Address,
+    pub pool_base_token_account: Address,
+    pub pool_quote_token_account: Address,
     pub pool_base_token_reserves: u64,
     pub pool_quote_token_reserves: u64,
-    pub coin_creator_vault_ata: Pubkey,
-    pub coin_creator_vault_authority: Pubkey,
-    pub base_token_program: Pubkey,
-    pub quote_token_program: Pubkey,
-    pub fee_recipient: Pubkey,
+    pub coin_creator_vault_ata: Address,
+    pub coin_creator_vault_authority: Address,
+    pub base_token_program: Address,
+    pub quote_token_program: Address,
+    pub fee_recipient: Address,
     pub is_cashback_coin: bool,
     pub is_mayhem_mode: bool,
 }
@@ -50,7 +59,7 @@ impl TradeInfo {
         let fee_recipient = if params.is_mayhem_mode {
             MAYHEM_FEE_RECIPIENT_SWAP
         } else {
-            Pubkey::default()
+            Address::default()
         };
 
         Self {
@@ -69,6 +78,10 @@ impl TradeInfo {
             is_cashback_coin: params.is_cashback_coin,
             is_mayhem_mode: params.is_mayhem_mode,
         }
+    }
+
+    pub fn base_mint_pubkey(&self) -> Pubkey {
+        address_to_pubkey(&self.base_mint)
     }
 
     pub fn derive_canonical_pool_address(mint: &Pubkey) -> Pubkey {
@@ -401,7 +414,7 @@ impl Trader {
         log::info!("Using pool: {}", trade_info.pool);
         log::info!("Is cashback coin: {}", trade_info.is_cashback_coin);
 
-        let token_balance = self.get_token_balance(trade_info.base_mint).await?;
+        let token_balance = self.get_token_balance(&trade_info.base_mint).await?;
         if token_balance == 0 {
             return Err(anyhow::anyhow!("No token balance to sell for mint: {}", trade_info.base_mint));
         }
@@ -461,7 +474,7 @@ impl Trader {
         }
     }
 
-    async fn get_token_balance(&self, mint: Pubkey) -> Result<u64> {
+    async fn get_token_balance(&self, mint: &Address) -> Result<u64> {
         let owner = self.client.get_payer();
         let owner_bytes = owner.pubkey().to_bytes();
         let mint_bytes = mint.to_bytes();
