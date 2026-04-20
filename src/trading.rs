@@ -144,6 +144,8 @@ impl Trader {
         ];
 
         let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+            .create_wsol_ata_on_startup(true)
+            .use_seed_optimize(false)
             .build();
 
         let client = TradingClient::new(Arc::new(keypair), trade_config).await;
