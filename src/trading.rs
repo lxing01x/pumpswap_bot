@@ -55,12 +55,20 @@ pub struct TokenTradeRecord {
     pub token_amount: u64,
     pub sol_amount: u64,
     pub price: f64,
-    pub timestamp: i64,
+    pub blocktime_us: i64,
     pub is_buy: bool,
+    pub signature: String,
 }
 
 impl TokenTradeRecord {
-    pub fn new(mint: &str, token_amount: u64, sol_amount: u64, is_buy: bool) -> Self {
+    pub fn new(
+        mint: &str,
+        token_amount: u64,
+        sol_amount: u64,
+        is_buy: bool,
+        signature: &str,
+        blocktime_us: i64,
+    ) -> Self {
         let price = if token_amount > 0 {
             sol_amount as f64 / token_amount as f64
         } else {
@@ -71,19 +79,45 @@ impl TokenTradeRecord {
             token_amount,
             sol_amount,
             price,
-            timestamp: Utc::now().timestamp(),
+            blocktime_us,
             is_buy,
+            signature: signature.to_string(),
         }
     }
 
-    pub fn with_price(mint: &str, price: f64, is_buy: bool) -> Self {
+    pub fn new_now(mint: &str, token_amount: u64, sol_amount: u64, is_buy: bool, signature: &str) -> Self {
+        let blocktime_us = Utc::now().timestamp_micros();
+        Self::new(mint, token_amount, sol_amount, is_buy, signature, blocktime_us)
+    }
+
+    pub fn with_price(
+        mint: &str,
+        price: f64,
+        is_buy: bool,
+        signature: &str,
+        blocktime_us: i64,
+    ) -> Self {
         Self {
             mint: mint.to_string(),
             token_amount: 0,
             sol_amount: 0,
             price,
-            timestamp: Utc::now().timestamp(),
+            blocktime_us,
             is_buy,
+            signature: signature.to_string(),
+        }
+    }
+
+    pub fn with_price_now(mint: &str, price: f64, is_buy: bool, signature: &str) -> Self {
+        let blocktime_us = Utc::now().timestamp_micros();
+        Self::with_price(mint, price, is_buy, signature, blocktime_us)
+    }
+
+    pub fn calculate_price_from_amounts(sol_amount: u64, token_amount: u64) -> f64 {
+        if token_amount > 0 {
+            sol_amount as f64 / token_amount as f64
+        } else {
+            0.0
         }
     }
 }
@@ -103,19 +137,45 @@ impl RedisStore {
         })
     }
 
+    fn signatures_key(mint: &str) -> String {
+        format!("sigs:{}", mint)
+    }
+
+    pub async fn is_signature_exists(&self, mint: &str, signature: &str) -> Result<bool> {
+        let sigs_key = Self::signatures_key(mint);
+        let mut conn = self.client.get_async_connection().await
+            .context("Failed to get Redis connection")?;
+        
+        let exists: bool = conn.sismember(&sigs_key, signature).await
+            .context("Failed to check signature existence")?;
+        
+        Ok(exists)
+    }
+
     pub async fn store_trade(&self, mint: &str, record: &TokenTradeRecord) -> Result<()> {
+        if self.is_signature_exists(mint, &record.signature).await? {
+            log::debug!("Signature {} already exists, skipping duplicate", record.signature);
+            return Ok(());
+        }
+
         let key = format!("trades:{}", mint);
+        let sigs_key = Self::signatures_key(mint);
         let serialized = serde_json::to_string(record)
             .context("Failed to serialize trade record")?;
         
         let mut conn = self.client.get_async_connection().await
             .context("Failed to get Redis connection")?;
         
-        conn.lpush::<_, _, ()>(&key, serialized).await
-            .context("Failed to push trade record to Redis")?;
+        let _: () = redis::pipe()
+            .atomic()
+            .lpush(&key, &serialized)
+            .ltrim(&key, 0, self.max_trades_per_token as isize - 1)
+            .sadd(&sigs_key, &record.signature)
+            .query_async(&mut conn).await
+            .context("Failed to store trade record to Redis")?;
         
-        conn.ltrim::<_, ()>(&key, 0, self.max_trades_per_token as isize - 1).await
-            .context("Failed to trim Redis list")?;
+        log::debug!("Stored trade record for {}: signature={}, blocktime_us={}", 
+            mint, record.signature, record.blocktime_us);
         
         Ok(())
     }
@@ -135,20 +195,39 @@ impl RedisStore {
             result.push(record);
         }
         
+        result.sort_by(|a, b| b.blocktime_us.cmp(&a.blocktime_us));
+        
         Ok(result)
     }
 
     pub async fn get_trades_in_window(&self, mint: &str, seconds: u64) -> Result<Vec<TokenTradeRecord>> {
-        let now = Utc::now().timestamp();
-        let cutoff = now - seconds as i64;
+        let now_us = Utc::now().timestamp_micros();
+        let cutoff_us = now_us - (seconds as i64 * 1_000_000);
         
         let trades = self.get_recent_trades(mint, self.max_trades_per_token).await?;
         let filtered: Vec<TokenTradeRecord> = trades
             .into_iter()
-            .filter(|t| t.timestamp >= cutoff)
+            .filter(|t| t.blocktime_us >= cutoff_us)
             .collect();
         
         Ok(filtered)
+    }
+
+    pub async fn get_latest_price_from_trades(&self, mint: &str) -> Result<Option<f64>> {
+        let trades = self.get_recent_trades(mint, 1).await?;
+        
+        if let Some(latest) = trades.first() {
+            if latest.token_amount > 0 && latest.sol_amount > 0 {
+                let price = TokenTradeRecord::calculate_price_from_amounts(
+                    latest.sol_amount, 
+                    latest.token_amount
+                );
+                return Ok(Some(price));
+            }
+            return Ok(Some(latest.price));
+        }
+        
+        Ok(None)
     }
 
     pub async fn calculate_price_change(&self, mint: &str, seconds: u64) -> Result<Option<f64>> {
@@ -158,8 +237,26 @@ impl RedisStore {
             return Ok(None);
         }
         
-        let oldest_price = trades.last().unwrap().price;
-        let newest_price = trades.first().unwrap().price;
+        let sorted_trades: Vec<&TokenTradeRecord> = {
+            let mut temp: Vec<&TokenTradeRecord> = trades.iter().collect();
+            temp.sort_by(|a, b| a.blocktime_us.cmp(&b.blocktime_us));
+            temp
+        };
+        
+        let oldest = sorted_trades.first().unwrap();
+        let newest = sorted_trades.last().unwrap();
+        
+        let oldest_price = if oldest.token_amount > 0 && oldest.sol_amount > 0 {
+            TokenTradeRecord::calculate_price_from_amounts(oldest.sol_amount, oldest.token_amount)
+        } else {
+            oldest.price
+        };
+        
+        let newest_price = if newest.token_amount > 0 && newest.sol_amount > 0 {
+            TokenTradeRecord::calculate_price_from_amounts(newest.sol_amount, newest.token_amount)
+        } else {
+            newest.price
+        };
         
         if oldest_price == 0.0 {
             return Ok(None);
