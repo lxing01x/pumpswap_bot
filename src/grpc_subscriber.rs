@@ -2,6 +2,7 @@ use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tonic::{metadata::MetadataValue, Request, transport::ClientTlsConfig};
@@ -59,6 +60,24 @@ impl GrpcSubscriber {
         tx: mpsc::UnboundedSender<TransactionUpdate>,
     ) -> Result<()> {
         log::info!("Connecting to gRPC: {}", grpc_url);
+        
+        match &grpc_token {
+            Some(token) => {
+                if token.is_empty() {
+                    log::warn!("gRPC token is empty! The service may require a valid token.");
+                    log::warn!("Get a token from: https://www.allnodes.com/publicnode");
+                } else {
+                    log::info!("gRPC token is configured (length: {})", token.len());
+                    log::debug!("Token preview: {}...", &token[..token.len().min(8)]);
+                }
+            }
+            None => {
+                log::warn!("gRPC token is not configured!");
+                log::warn!("The Solana Yellowstone gRPC service requires a personal token.");
+                log::warn!("Get a token from: https://www.allnodes.com/publicnode");
+                log::warn!("Add 'grpc_token' field to your config.json");
+            }
+        }
         
         let endpoint_url = if grpc_url.starts_with("http") {
             grpc_url.clone()
@@ -120,16 +139,26 @@ impl GrpcSubscriber {
         };
 
         let token_clone = grpc_token.clone();
+        log::info!("Setting up gRPC interceptor with token...");
+        
         let interceptor = move |mut req: Request<()>| {
-            if let Some(ref token) = token_clone {
-                let token: MetadataValue<_> = match format!("Bearer {}", token).parse() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        log::error!("Failed to parse token: {:?}", e);
-                        return Err(tonic::Status::internal("Invalid token"));
-                    }
-                };
-                req.metadata_mut().insert("x-token", token);
+            match &token_clone {
+                Some(token) if !token.is_empty() => {
+                    let bearer_token = format!("Bearer {}", token);
+                    log::debug!("Adding x-token header to gRPC request");
+                    
+                    let token_metadata: MetadataValue<_> = match bearer_token.parse() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::error!("Failed to parse token: {:?}", e);
+                            return Err(tonic::Status::internal("Invalid token"));
+                        }
+                    };
+                    req.metadata_mut().insert("x-token", token_metadata);
+                }
+                _ => {
+                    log::warn!("No valid token configured, gRPC request may be rejected");
+                }
             }
             Ok(req)
         };
@@ -201,6 +230,27 @@ impl GrpcSubscriber {
                 log::error!("Error code: {:?}", e.code());
                 log::error!("Error message: {}", e.message());
                 log::error!("Error details: {:?}", e.details());
+                
+                if e.code() == tonic::Code::PermissionDenied {
+                    log::error!("====================================================================");
+                    log::error!("PERMISSION DENIED: The gRPC service requires a valid personal token.");
+                    log::error!("====================================================================");
+                    log::error!("");
+                    log::error!("SOLUTION:");
+                    log::error!("  1. Go to: https://www.allnodes.com/publicnode");
+                    log::error!("  2. Sign up or log in");
+                    log::error!("  3. Get your personal API token");
+                    log::error!("  4. Add the token to your config.json:");
+                    log::error!("");
+                    log::error!("    {{");
+                    log::error!("      ...");
+                    log::error!("      \"grpc_token\": \"your-token-here\"");
+                    log::error!("      ...");
+                    log::error!("    }}");
+                    log::error!("");
+                    log::error!("====================================================================");
+                }
+                
                 if let Some(source) = e.source() {
                     log::error!("Error source: {:?}", source);
                 }

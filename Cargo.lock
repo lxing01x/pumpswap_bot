@@ -4050,6 +4050,9 @@ dependencies = [
  "log",
  "prost 0.13.5",
  "redis",
+ "rustls 0.23.38",
+ "rustls-native-certs",
+ "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
  "sol-trade-sdk",
@@ -4068,6 +4071,7 @@ dependencies = [
  "tokio-stream",
  "tonic 0.12.3",
  "url",
+ "webpki-roots 1.0.6",
  "yellowstone-grpc-proto",
 ]
 
@@ -9534,6 +9538,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
+ "rustls-native-certs",
  "rustls-pemfile 2.2.0",
  "socket2 0.5.10",
  "tokio",
