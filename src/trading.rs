@@ -103,11 +103,23 @@ impl TokenTradeRecord {
         signature: &str,
         blocktime_us: i64,
     ) -> Self {
+        // sol_amount is in lamports (1 SOL = 1_000_000_000 lamports, 9 decimals)
+        // token_amount is in token's smallest unit (Pump.fun tokens have 6 decimals)
+        // 
+        // Correct price calculation:
+        // SOL = sol_amount / 10^9
+        // tokens = token_amount / 10^6
+        // price = SOL / tokens = (sol_amount / 10^9) / (token_amount / 10^6)
+        //       = (sol_amount / token_amount) * (10^6 / 10^9)
+        //       = (sol_amount / token_amount) / 1000
+        
         let price = if token_amount > 0 {
-            sol_amount as f64 / token_amount as f64
+            (sol_amount as f64 / token_amount as f64) / 1000.0
         } else {
             0.0
         };
+        log::info!("TokenTradeRecord: mint={}, token_amount={}, sol_amount={}, price={:.12} SOL/token", 
+            mint, token_amount, sol_amount, price);
         Self {
             mint: mint.to_string(),
             token_amount,
@@ -120,19 +132,18 @@ impl TokenTradeRecord {
     }
 
     pub fn calculate_price_from_amounts(sol_amount: u64, token_amount: u64) -> f64 {
+        // sol_amount is in lamports (9 decimals), token_amount is in token units (6 decimals)
+        // price = (sol_amount / token_amount) / 1000
         if token_amount > 0 {
-            sol_amount as f64 / token_amount as f64
+            (sol_amount as f64 / token_amount as f64) / 1000.0
         } else {
             0.0
         }
     }
 
     pub fn effective_price(&self) -> f64 {
-        if self.token_amount > 0 && self.sol_amount > 0 {
-            Self::calculate_price_from_amounts(self.sol_amount, self.token_amount)
-        } else {
-            self.price
-        }
+        // Use the pre-calculated price field which is already correctly computed
+        self.price
     }
 }
 
@@ -218,12 +229,23 @@ impl RedisStore {
         let now_us = Utc::now().timestamp_micros();
         let cutoff_us = now_us - (seconds as i64 * 1_000_000);
         
+        log::info!("get_trades_in_window: mint={}, seconds={}, now_us={}, cutoff_us={}", 
+            mint, seconds, now_us, cutoff_us);
+        
         let trades = self.get_recent_trades(mint, self.max_trades_per_token).await?;
+        log::info!("  Total trades in Redis: {}", trades.len());
+        
         let filtered: Vec<TokenTradeRecord> = trades
             .into_iter()
-            .filter(|t| t.blocktime_us >= cutoff_us)
+            .filter(|t| {
+                let in_window = t.blocktime_us >= cutoff_us;
+                // log::info!("    Trade (sig={}, blocktime_us={}): in_window={}", 
+                //     t.signature, t.blocktime_us, in_window);
+                in_window
+            })
             .collect();
         
+        log::info!("  Trades in window: {}", filtered.len());
         Ok(filtered)
     }
 
@@ -239,6 +261,12 @@ impl RedisStore {
 
     pub async fn calculate_price_change(&self, mint: &str, seconds: u64) -> Result<Option<f64>> {
         let trades = self.get_trades_in_window(mint, seconds).await?;
+        
+        log::info!("calculate_price_change: mint={}, seconds={}, trades_in_window={}", mint, seconds, trades.len());
+        for (i, trade) in trades.iter().enumerate() {
+            log::info!("  Trade {}: signature={}, blocktime_us={}, price={:.12}", 
+                i, trade.signature, trade.blocktime_us, trade.effective_price());
+        }
         
         if trades.len() < 2 {
             return Ok(None);
