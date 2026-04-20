@@ -21,6 +21,23 @@ pub struct BotConfig {
     pub max_retries: u32,
     #[serde(default = "default_retry_delay_ms")]
     pub retry_delay_ms: u64,
+    #[serde(default = "default_jito_enabled")]
+    pub jito_enabled: bool,
+    pub jito_uuid: Option<String>,
+    #[serde(default = "default_jito_region")]
+    pub jito_region: String,
+    #[serde(default = "default_redis_url")]
+    pub redis_url: String,
+    #[serde(default = "default_max_trades_per_token")]
+    pub max_trades_per_token: usize,
+    #[serde(default = "default_buy_threshold_pct")]
+    pub buy_threshold_pct: f64,
+    #[serde(default = "default_buy_time_window_sec")]
+    pub buy_time_window_sec: u64,
+    #[serde(default = "default_sell_profit_pct")]
+    pub sell_profit_pct: f64,
+    #[serde(default = "default_sell_stop_loss_pct")]
+    pub sell_stop_loss_pct: f64,
 }
 
 fn default_max_retries() -> u32 {
@@ -29,6 +46,38 @@ fn default_max_retries() -> u32 {
 
 fn default_retry_delay_ms() -> u64 {
     1000
+}
+
+fn default_jito_enabled() -> bool {
+    false
+}
+
+fn default_jito_region() -> String {
+    "Frankfurt".to_string()
+}
+
+fn default_redis_url() -> String {
+    "redis://127.0.0.1/".to_string()
+}
+
+fn default_max_trades_per_token() -> usize {
+    1000
+}
+
+fn default_buy_threshold_pct() -> f64 {
+    10.0
+}
+
+fn default_buy_time_window_sec() -> u64 {
+    5
+}
+
+fn default_sell_profit_pct() -> f64 {
+    10.0
+}
+
+fn default_sell_stop_loss_pct() -> f64 {
+    5.0
 }
 
 impl BotConfig {

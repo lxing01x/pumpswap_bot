@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
+use redis::{AsyncCommands, Client as RedisClient};
 use solana_address::Address;
 use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
@@ -8,7 +10,7 @@ use solana_sdk::pubkey::Pubkey;
 use sol_trade_sdk::{
     TradingClient,
     common::types::TradeConfig,
-    swqos::SwqosConfig,
+    swqos::{SwqosConfig, SwqosRegion},
     common::gas_fee_strategy::GasFeeStrategy,
     trading::factory::DexType,
     TradeBuyParams,
@@ -16,6 +18,7 @@ use sol_trade_sdk::{
     TradeTokenType,
     trading::core::params::{DexParamEnum, PumpSwapParams},
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
@@ -34,6 +37,126 @@ fn pubkey_to_address(pubkey: &Pubkey) -> Address {
 
 fn address_to_pubkey(address: &Address) -> Pubkey {
     Pubkey::from(address.to_bytes())
+}
+
+fn parse_jito_region(region: &str) -> SwqosRegion {
+    match region.to_lowercase().as_str() {
+        "frankfurt" => SwqosRegion::Frankfurt,
+        "newyork" => SwqosRegion::NewYork,
+        "tokyo" => SwqosRegion::Tokyo,
+        "amsterdam" => SwqosRegion::Amsterdam,
+        _ => SwqosRegion::Frankfurt,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenTradeRecord {
+    pub mint: String,
+    pub token_amount: u64,
+    pub sol_amount: u64,
+    pub price: f64,
+    pub timestamp: i64,
+    pub is_buy: bool,
+}
+
+impl TokenTradeRecord {
+    pub fn new(mint: &str, token_amount: u64, sol_amount: u64, is_buy: bool) -> Self {
+        let price = if sol_amount > 0 {
+            token_amount as f64 / sol_amount as f64
+        } else {
+            0.0
+        };
+        Self {
+            mint: mint.to_string(),
+            token_amount,
+            sol_amount,
+            price,
+            timestamp: Utc::now().timestamp(),
+            is_buy,
+        }
+    }
+}
+
+pub struct RedisStore {
+    client: RedisClient,
+    max_trades_per_token: usize,
+}
+
+impl RedisStore {
+    pub fn new(redis_url: &str, max_trades_per_token: usize) -> Result<Self> {
+        let client = RedisClient::open(redis_url)
+            .context("Failed to create Redis client")?;
+        Ok(Self {
+            client,
+            max_trades_per_token,
+        })
+    }
+
+    pub async fn store_trade(&self, mint: &str, record: &TokenTradeRecord) -> Result<()> {
+        let key = format!("trades:{}", mint);
+        let serialized = serde_json::to_string(record)
+            .context("Failed to serialize trade record")?;
+        
+        let mut conn = self.client.get_async_connection().await
+            .context("Failed to get Redis connection")?;
+        
+        conn.lpush::<_, _, ()>(&key, serialized).await
+            .context("Failed to push trade record to Redis")?;
+        
+        conn.ltrim::<_, ()>(&key, 0, self.max_trades_per_token as isize - 1).await
+            .context("Failed to trim Redis list")?;
+        
+        Ok(())
+    }
+
+    pub async fn get_recent_trades(&self, mint: &str, limit: usize) -> Result<Vec<TokenTradeRecord>> {
+        let key = format!("trades:{}", mint);
+        let mut conn = self.client.get_async_connection().await
+            .context("Failed to get Redis connection")?;
+        
+        let records: Vec<String> = conn.lrange(&key, 0, limit as isize - 1).await
+            .context("Failed to get trade records from Redis")?;
+        
+        let mut result = Vec::with_capacity(records.len());
+        for record_str in records {
+            let record: TokenTradeRecord = serde_json::from_str(&record_str)
+                .context("Failed to deserialize trade record")?;
+            result.push(record);
+        }
+        
+        Ok(result)
+    }
+
+    pub async fn get_trades_in_window(&self, mint: &str, seconds: u64) -> Result<Vec<TokenTradeRecord>> {
+        let now = Utc::now().timestamp();
+        let cutoff = now - seconds as i64;
+        
+        let trades = self.get_recent_trades(mint, self.max_trades_per_token).await?;
+        let filtered: Vec<TokenTradeRecord> = trades
+            .into_iter()
+            .filter(|t| t.timestamp >= cutoff)
+            .collect();
+        
+        Ok(filtered)
+    }
+
+    pub async fn calculate_price_change(&self, mint: &str, seconds: u64) -> Result<Option<f64>> {
+        let trades = self.get_trades_in_window(mint, seconds).await?;
+        
+        if trades.len() < 2 {
+            return Ok(None);
+        }
+        
+        let oldest_price = trades.last().unwrap().price;
+        let newest_price = trades.first().unwrap().price;
+        
+        if oldest_price == 0.0 {
+            return Ok(None);
+        }
+        
+        let change_pct = ((newest_price - oldest_price) / oldest_price) * 100.0;
+        Ok(Some(change_pct))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +242,8 @@ pub struct Trader {
     slippage_bps: u64,
     max_retries: u32,
     retry_delay_ms: u64,
+    buy_price: Option<f64>,
+    buy_sol_amount: u64,
 }
 
 impl Trader {
@@ -127,7 +252,7 @@ impl Trader {
         keypair: Keypair,
         slippage_bps: u64,
     ) -> Result<Self> {
-        Self::new_with_retry(rpc_url, keypair, slippage_bps, 5, 1000).await
+        Self::new_with_options(rpc_url, keypair, slippage_bps, 5, 1000, false, None, "Frankfurt").await
     }
 
     pub async fn new_with_retry(
@@ -137,11 +262,32 @@ impl Trader {
         max_retries: u32,
         retry_delay_ms: u64,
     ) -> Result<Self> {
+        Self::new_with_options(rpc_url, keypair, slippage_bps, max_retries, retry_delay_ms, false, None, "Frankfurt").await
+    }
+
+    pub async fn new_with_options(
+        rpc_url: String,
+        keypair: Keypair,
+        slippage_bps: u64,
+        max_retries: u32,
+        retry_delay_ms: u64,
+        jito_enabled: bool,
+        jito_uuid: Option<String>,
+        jito_region: &str,
+    ) -> Result<Self> {
         let commitment = CommitmentConfig::finalized();
         
-        let swqos_configs: Vec<SwqosConfig> = vec![
-            SwqosConfig::Default(rpc_url.clone()),
-        ];
+        let swqos_configs: Vec<SwqosConfig> = if jito_enabled {
+            let jito_uuid = jito_uuid.unwrap_or_default();
+            let region = parse_jito_region(jito_region);
+            vec![
+                SwqosConfig::Jito(jito_uuid, region, None),
+            ]
+        } else {
+            vec![
+                SwqosConfig::Default(rpc_url.clone()),
+            ]
+        };
 
         let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
             .create_wsol_ata_on_startup(true)
@@ -155,6 +301,8 @@ impl Trader {
             slippage_bps,
             max_retries,
             retry_delay_ms,
+            buy_price: None,
+            buy_sol_amount: 0,
         })
     }
 
@@ -344,8 +492,59 @@ impl Trader {
         )
     }
 
+    pub fn set_buy_price(&mut self, price: f64, sol_amount: u64) {
+        self.buy_price = Some(price);
+        self.buy_sol_amount = sol_amount;
+    }
+
+    pub fn get_buy_price(&self) -> Option<f64> {
+        self.buy_price
+    }
+
+    pub fn get_buy_sol_amount(&self) -> u64 {
+        self.buy_sol_amount
+    }
+
+    pub fn calculate_price_from_pool(&self, trade_info: &TradeInfo) -> f64 {
+        let base_reserves = trade_info.pool_base_token_reserves as f64;
+        let quote_reserves = trade_info.pool_quote_token_reserves as f64;
+        
+        if quote_reserves == 0.0 {
+            0.0
+        } else {
+            base_reserves / quote_reserves
+        }
+    }
+
+    pub fn calculate_profit_loss_pct(&self, current_price: f64) -> Option<f64> {
+        match self.buy_price {
+            Some(buy_price) if buy_price > 0.0 => {
+                let pct = ((current_price - buy_price) / buy_price) * 100.0;
+                Some(pct)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn should_sell(&self, current_price: f64, profit_threshold: f64, stop_loss_threshold: f64) -> bool {
+        match self.calculate_profit_loss_pct(current_price) {
+            Some(pct) => {
+                if pct >= profit_threshold {
+                    log::info!("Should sell: Profit {:.2}% exceeds threshold {:.2}%", pct, profit_threshold);
+                    true
+                } else if pct <= -stop_loss_threshold {
+                    log::info!("Should sell: Loss {:.2}% exceeds stop loss threshold {:.2}%", pct.abs(), stop_loss_threshold);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
     pub async fn buy(
-        &self,
+        &mut self,
         trade_info: &TradeInfo,
         sol_amount: u64,
     ) -> Result<()> {
@@ -353,6 +552,9 @@ impl Trader {
         log::info!("Buy amount: {} lamports ({:.9} SOL)", sol_amount, sol_amount as f64 / 1_000_000_000.0);
         log::info!("Using pool: {}", trade_info.pool);
         log::info!("Is cashback coin: {}", trade_info.is_cashback_coin);
+
+        let current_price = self.calculate_price_from_pool(trade_info);
+        log::info!("Current price before buy: {} token/SOL", current_price);
 
         let gas_fee_strategy = GasFeeStrategy::new();
         gas_fee_strategy.set_global_fee_strategy(
@@ -395,6 +597,8 @@ impl Trader {
             Ok((success, sigs, error, _timings)) => {
                 if success {
                     log::info!("Buy transaction successful! Signatures: {:?}", sigs);
+                    self.set_buy_price(current_price, sol_amount);
+                    log::info!("Recorded buy price: {} token/SOL, sol_amount: {} lamports", current_price, sol_amount);
                     Ok(())
                 } else {
                     log::error!("Buy transaction failed: {:?}", error);
