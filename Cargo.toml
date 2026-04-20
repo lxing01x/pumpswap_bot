@@ -30,7 +30,11 @@ url = "2.5"
 chrono = "0.4"
 
 yellowstone-grpc-proto = { version = "5", features = ["tonic"] }
-tonic = { version = "0.12", features = ["tls", "transport"] }
+tonic = { version = "0.12", features = ["tls", "transport", "tls-roots"] }
+rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2.2"
+webpki-roots = "1.0"
 prost = "0.13"
 redis = { version = "0.24", features = ["tokio-comp"] }
 bs58 = "0.5"
