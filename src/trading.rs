@@ -282,6 +282,48 @@ impl RedisStore {
         let change_pct = ((newest_price - oldest_price) / oldest_price) * 100.0;
         Ok(Some(change_pct))
     }
+
+    pub async fn calculate_price_change_from_records(&self, mint: &str, record_count: usize) -> Result<Option<f64>> {
+        let trades = self.get_recent_trades(mint, record_count).await?;
+        
+        log::info!("calculate_price_change_from_records: mint={}, record_count={}, total_trades={}", mint, record_count, trades.len());
+        for (i, trade) in trades.iter().enumerate() {
+            log::info!("  Trade {}: signature={}, blocktime_us={}, price={:.12}", 
+                i, trade.signature, trade.blocktime_us, trade.effective_price());
+        }
+        
+        if trades.len() < 2 {
+            return Ok(None);
+        }
+        
+        let oldest_price = trades.last().unwrap().effective_price();
+        let newest_price = trades.first().unwrap().effective_price();
+        
+        if oldest_price == 0.0 {
+            return Ok(None);
+        }
+        
+        let change_pct = ((newest_price - oldest_price) / oldest_price) * 100.0;
+        Ok(Some(change_pct))
+    }
+
+    pub async fn get_active_mints(&self) -> Result<Vec<String>> {
+        let mut conn = self.client.get_async_connection().await
+            .context("Failed to get Redis connection")?;
+        
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg("trades:*")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
+        
+        let mints: Vec<String> = keys
+            .into_iter()
+            .filter_map(|k| k.strip_prefix("trades:").map(|s| s.to_string()))
+            .collect();
+        
+        Ok(mints)
+    }
 }
 
 #[derive(Debug, Clone)]

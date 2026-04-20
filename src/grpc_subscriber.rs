@@ -1,5 +1,4 @@
 use anyhow::Result;
-use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
@@ -28,15 +27,13 @@ pub struct TransactionUpdate {
 pub struct GrpcSubscriber {
     grpc_url: String,
     grpc_token: Option<String>,
-    target_mint: Pubkey,
 }
 
 impl GrpcSubscriber {
-    pub fn new(grpc_url: String, grpc_token: Option<String>, target_mint: Pubkey) -> Self {
+    pub fn new(grpc_url: String, grpc_token: Option<String>) -> Self {
         Self {
             grpc_url,
             grpc_token,
-            target_mint,
         }
     }
 
@@ -45,12 +42,11 @@ impl GrpcSubscriber {
         
         let grpc_url = self.grpc_url.clone();
         let grpc_token = self.grpc_token.clone();
-        let target_mint = self.target_mint;
         
         let tx = Arc::new(Mutex::new(tx));
         
         tokio::spawn(async move {
-            if let Err(e) = Self::run_subscription(grpc_url, grpc_token, target_mint, tx).await {
+            if let Err(e) = Self::run_subscription(grpc_url, grpc_token, tx).await {
                 log::error!("gRPC subscription error: {:?}", e);
             }
         });
@@ -61,7 +57,6 @@ impl GrpcSubscriber {
     async fn run_subscription(
         grpc_url: String,
         grpc_token: Option<String>,
-        target_mint: Pubkey,
         tx: Arc<Mutex<mpsc::UnboundedSender<TransactionUpdate>>>,
     ) -> Result<()> {
         log::info!("Connecting to gRPC: {}", grpc_url);
@@ -117,13 +112,13 @@ impl GrpcSubscriber {
         log::info!("Subscribing to PumpSwap events...");
         log::info!("  - Protocols: {:?}", protocols);
         log::info!("  - Event types: PumpSwapBuy, PumpSwapSell");
-        log::info!("  - Target mint: {}", target_mint);
+        log::info!("  - Listening to ALL tokens (WSOL pairs)");
         
         let tx_clone = tx.clone();
         let callback = move |event: Box<dyn UnifiedEvent>| {
             let tx = tx_clone.clone();
             tokio::spawn(async move {
-                Self::handle_event(event, target_mint, tx).await;
+                Self::handle_event(event, tx).await;
             });
         };
         
@@ -151,40 +146,33 @@ impl GrpcSubscriber {
 
     async fn handle_event(
         event: Box<dyn UnifiedEvent>,
-        target_mint: Pubkey,
         tx: Arc<Mutex<mpsc::UnboundedSender<TransactionUpdate>>>,
     ) {
         match_event!(event, {
             PumpSwapBuyEvent => |e: PumpSwapBuyEvent| {
                 log::debug!("Received PumpSwapBuyEvent");
                 
-                if e.base_mint != target_mint && e.quote_mint != target_mint {
-                    log::debug!("Event not for target mint: base={}, quote={}, target={}", 
-                        e.base_mint, e.quote_mint, target_mint);
-                    return;
-                }
+                let is_wsol_base = e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
+                let is_wsol_quote = e.quote_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
                 
-                let mint = if e.base_mint == target_mint {
-                    e.base_mint
-                } else {
-                    e.quote_mint
-                };
-                
-                let is_wsol = e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT 
-                    || e.quote_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
-                
-                if !is_wsol {
+                if !is_wsol_base && !is_wsol_quote {
                     log::debug!("Event not involving WSOL: base={}, quote={}", e.base_mint, e.quote_mint);
                     return;
                 }
                 
-                let (token_amount, sol_amount) = if e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT {
+                let mint = if is_wsol_base {
+                    e.quote_mint
+                } else {
+                    e.base_mint
+                };
+                
+                let (token_amount, sol_amount) = if is_wsol_base {
                     (e.pool_quote_token_reserves, e.pool_base_token_reserves)
                 } else {
                     (e.pool_base_token_reserves, e.pool_quote_token_reserves)
                 };
                 
-                let blocktime_us = e.timestamp as i64 * 1_000_000; // timestamp is in seconds, convert to microseconds
+                let blocktime_us = e.timestamp as i64 * 1_000_000;
                 let signature = e.signature().to_string();
                 
                 log::info!(
@@ -211,33 +199,27 @@ impl GrpcSubscriber {
             PumpSwapSellEvent => |e: PumpSwapSellEvent| {
                 log::debug!("Received PumpSwapSellEvent");
                 
-                if e.base_mint != target_mint && e.quote_mint != target_mint {
-                    log::debug!("Event not for target mint: base={}, quote={}, target={}", 
-                        e.base_mint, e.quote_mint, target_mint);
-                    return;
-                }
+                let is_wsol_base = e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
+                let is_wsol_quote = e.quote_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
                 
-                let mint = if e.base_mint == target_mint {
-                    e.base_mint
-                } else {
-                    e.quote_mint
-                };
-                
-                let is_wsol = e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT 
-                    || e.quote_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
-                
-                if !is_wsol {
+                if !is_wsol_base && !is_wsol_quote {
                     log::debug!("Event not involving WSOL: base={}, quote={}", e.base_mint, e.quote_mint);
                     return;
                 }
                 
-                let (token_amount, sol_amount) = if e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT {
+                let mint = if is_wsol_base {
+                    e.quote_mint
+                } else {
+                    e.base_mint
+                };
+                
+                let (token_amount, sol_amount) = if is_wsol_base {
                     (e.pool_quote_token_reserves, e.pool_base_token_reserves)
                 } else {
                     (e.pool_base_token_reserves, e.pool_quote_token_reserves)
                 };
                 
-                let blocktime_us = e.timestamp as i64 * 1_000_000; // timestamp is in seconds, convert to microseconds
+                let blocktime_us = e.timestamp as i64 * 1_000_000;
                 let signature = e.signature().to_string();
                 
                 log::info!(
