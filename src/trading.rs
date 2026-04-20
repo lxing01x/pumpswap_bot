@@ -751,16 +751,14 @@ impl Trader {
                 "Insufficient wallet balance for buy operation. \n\
                 Wallet balance: {} lamports ({:.9} SOL)\n\
                 Required: {} lamports ({:.9} SOL) [buy amount: {} + gas reserve: {}]\n\
-                Skipping buy operation for mint: {}",
+                Skipping buy operation for mint: {} and continuing...",
                 wallet_balance, wallet_balance as f64 / 1_000_000_000.0,
                 required_balance, required_balance as f64 / 1_000_000_000.0,
                 sol_amount, GAS_RESERVE_LAMPORTS,
                 trade_info.base_mint
             );
-            return Err(anyhow::anyhow!(
-                "Insufficient balance: have {} lamports, need {} lamports (buy: {} + gas: {})",
-                wallet_balance, required_balance, sol_amount, GAS_RESERVE_LAMPORTS
-            ));
+            log::info!("Buy operation skipped due to insufficient balance, continuing normal execution");
+            return Ok(());
         }
 
         log::info!("Wallet balance is sufficient for buy operation");
