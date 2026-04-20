@@ -1,0 +1,13 @@
+[package]
+name = "nonce_cache"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sol-trade-sdk = { path = "../.." }
+sol-parser-sdk = "0.2.2"
+solana-sdk = "3.0.0"
+solana-commitment-config = { version = "3.0.0", features = ["serde"] }
+spl-associated-token-account = "7.0.0"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0.94"
