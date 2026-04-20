@@ -119,30 +119,6 @@ impl TokenTradeRecord {
         }
     }
 
-    pub fn from_pool_price(
-        mint: &str,
-        base_reserves: u64,
-        quote_reserves: u64,
-        is_buy: bool,
-        signature: &str,
-        blocktime_us: i64,
-    ) -> Self {
-        let price = if base_reserves > 0 {
-            quote_reserves as f64 / base_reserves as f64
-        } else {
-            0.0
-        };
-        Self {
-            mint: mint.to_string(),
-            token_amount: 0,
-            sol_amount: 0,
-            price,
-            blocktime_us,
-            is_buy,
-            signature: signature.to_string(),
-        }
-    }
-
     pub fn calculate_price_from_amounts(sol_amount: u64, token_amount: u64) -> f64 {
         if token_amount > 0 {
             sol_amount as f64 / token_amount as f64
