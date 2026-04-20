@@ -33,4 +33,3 @@ yellowstone-grpc-proto = { version = "5", features = ["tonic"] }
 tonic = "0.12"
 prost = "0.13"
 redis = { version = "0.24", features = ["tokio-comp"] }
-uuid = { version = "1.0", features = ["v4", "fast-rng"] }
