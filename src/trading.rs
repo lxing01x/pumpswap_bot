@@ -17,6 +17,7 @@ use sol_trade_sdk::{
     TradeSellParams,
     TradeTokenType,
     trading::core::params::{DexParamEnum, PumpSwapParams},
+    instruction::utils::pumpswap,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -550,79 +551,91 @@ impl Trader {
     ) -> Result<TradeInfo> {
         self.diagnose_pool_address(mint).await?;
 
-        let pool_address = TradeInfo::derive_canonical_pool_address(mint);
-        let pool_address_bytes = pool_address.to_bytes();
-        
-        log::info!("Derived canonical pool address: {}", pool_address);
+        log::info!("Searching for pool using find_by_mint (more reliable method) for mint: {}", mint);
 
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..self.max_retries {
             log::info!(
-                "Attempt {}/{} to fetch pool data (via from_pool_address_by_rpc) for pool: {}",
+                "Attempt {}/{} to find and fetch pool data for mint: {}",
                 attempt + 1,
                 self.max_retries,
-                pool_address
+                mint
             );
 
-            match PumpSwapParams::from_pool_address_by_rpc(
-                self.client.get_rpc(),
-                &pool_address_bytes.into(),
-            )
-            .await
-            {
-                Ok(params) => {
-                    log::info!("Successfully fetched pool data on attempt {}", attempt + 1);
-                    
-                    let trade_info = TradeInfo::from_pumpswap_params(&params);
-                    
-                    log::info!("TradeInfo built from pool data:");
-                    log::info!("  Pool: {}", trade_info.pool);
-                    log::info!("  Base mint: {}", trade_info.base_mint);
-                    log::info!("  Quote mint: {}", trade_info.quote_mint);
-                    log::info!("  Pool base token account: {}", trade_info.pool_base_token_account);
-                    log::info!("  Pool quote token account: {}", trade_info.pool_quote_token_account);
-                    log::info!("  Pool base token reserves: {}", trade_info.pool_base_token_reserves);
-                    log::info!("  Pool quote token reserves: {}", trade_info.pool_quote_token_reserves);
-                    log::info!("  Coin creator vault ATA: {}", trade_info.coin_creator_vault_ata);
-                    log::info!("  Coin creator vault authority: {}", trade_info.coin_creator_vault_authority);
-                    log::info!("  Base token program: {}", trade_info.base_token_program);
-                    log::info!("  Quote token program: {}", trade_info.quote_token_program);
-                    log::info!("  Fee recipient: {}", trade_info.fee_recipient);
-                    log::info!("  Is cashback coin: {}", trade_info.is_cashback_coin);
-                    log::info!("  Is mayhem mode: {}", trade_info.is_mayhem_mode);
-                    
-                    return Ok(trade_info);
+            match pumpswap::find_by_mint(self.client.get_rpc(), mint).await {
+                Ok((pool_address, pool_data)) => {
+                    log::info!("Successfully found pool on attempt {}: {}", attempt + 1, pool_address);
+                    log::info!("Using fetch_pool + from_pool_data to build complete params...");
+
+                    match PumpSwapParams::from_pool_data(
+                        self.client.get_rpc(),
+                        &pool_address,
+                        &pool_data,
+                    ).await {
+                        Ok(params) => {
+                            log::info!("Successfully built PumpSwapParams from pool data");
+                            
+                            let trade_info = TradeInfo::from_pumpswap_params(&params);
+                            
+                            log::info!("TradeInfo built from pool data:");
+                            log::info!("  Pool: {}", trade_info.pool);
+                            log::info!("  Base mint: {}", trade_info.base_mint);
+                            log::info!("  Quote mint: {}", trade_info.quote_mint);
+                            log::info!("  Pool base token account: {}", trade_info.pool_base_token_account);
+                            log::info!("  Pool quote token account: {}", trade_info.pool_quote_token_account);
+                            log::info!("  Pool base token reserves: {}", trade_info.pool_base_token_reserves);
+                            log::info!("  Pool quote token reserves: {}", trade_info.pool_quote_token_reserves);
+                            log::info!("  Coin creator vault ATA: {}", trade_info.coin_creator_vault_ata);
+                            log::info!("  Coin creator vault authority: {}", trade_info.coin_creator_vault_authority);
+                            log::info!("  Base token program: {}", trade_info.base_token_program);
+                            log::info!("  Quote token program: {}", trade_info.quote_token_program);
+                            log::info!("  Fee recipient: {}", trade_info.fee_recipient);
+                            log::info!("  Is cashback coin: {}", trade_info.is_cashback_coin);
+                            log::info!("  Is mayhem mode: {}", trade_info.is_mayhem_mode);
+                            
+                            return Ok(trade_info);
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Attempt {}/{} failed to build params from pool data: {}",
+                                attempt + 1,
+                                self.max_retries,
+                                e
+                            );
+                            last_error = Some(anyhow::anyhow!("{}", e));
+                        }
+                    }
                 }
                 Err(e) => {
                     log::warn!(
-                        "Attempt {}/{} failed to fetch pool data: {}",
+                        "Attempt {}/{} failed to find pool: {}",
                         attempt + 1,
                         self.max_retries,
                         e
                     );
                     last_error = Some(anyhow::anyhow!("{}", e));
-
-                    if attempt < self.max_retries - 1 {
-                        let delay = self.retry_delay_ms * (attempt as u64 + 1);
-                        log::info!("Waiting {} ms before next attempt...", delay);
-                        sleep(Duration::from_millis(delay)).await;
-                    }
                 }
+            }
+
+            if attempt < self.max_retries - 1 {
+                let delay = self.retry_delay_ms * (attempt as u64 + 1);
+                log::info!("Waiting {} ms before next attempt...", delay);
+                sleep(Duration::from_millis(delay)).await;
             }
         }
 
         Err(anyhow::anyhow!(
             "Failed to fetch pool data after {} attempts. Last error: {}. \n\
-            Pool address used: {} \n\
+            Mint: {} \n\
             Possible causes: \n\
             1) The token hasn't fully migrated to PumpSwap yet (check if bonding curve account still exists) \n\
             2) RPC node is not fully synced \n\
-            3) The pool address is incorrect \n\
+            3) The pool doesn't exist on PumpSwap \n\
             If the token is still in bonding curve stage, you may need to use PumpFun instead of PumpSwap.",
             self.max_retries,
             last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error")),
-            pool_address
+            mint
         ))
     }
 
@@ -719,6 +732,38 @@ impl Trader {
         log::info!("Buy amount: {} lamports ({:.9} SOL)", sol_amount, sol_amount as f64 / 1_000_000_000.0);
         log::info!("Using pool: {}", trade_info.pool);
         log::info!("Is cashback coin: {}", trade_info.is_cashback_coin);
+
+        let payer = self.client.get_payer();
+        let payer_pubkey = payer.pubkey();
+        let rpc = self.client.get_rpc();
+        
+        let wallet_balance = rpc.get_balance(&payer_pubkey).await
+            .context("Failed to get wallet balance")?;
+        
+        log::info!("Wallet balance: {} lamports ({:.9} SOL)", wallet_balance, wallet_balance as f64 / 1_000_000_000.0);
+
+        const GAS_RESERVE_LAMPORTS: u64 = 10_000_000;
+        let required_balance = sol_amount.checked_add(GAS_RESERVE_LAMPORTS)
+            .unwrap_or(u64::MAX);
+
+        if wallet_balance < required_balance {
+            log::warn!(
+                "Insufficient wallet balance for buy operation. \n\
+                Wallet balance: {} lamports ({:.9} SOL)\n\
+                Required: {} lamports ({:.9} SOL) [buy amount: {} + gas reserve: {}]\n\
+                Skipping buy operation for mint: {}",
+                wallet_balance, wallet_balance as f64 / 1_000_000_000.0,
+                required_balance, required_balance as f64 / 1_000_000_000.0,
+                sol_amount, GAS_RESERVE_LAMPORTS,
+                trade_info.base_mint
+            );
+            return Err(anyhow::anyhow!(
+                "Insufficient balance: have {} lamports, need {} lamports (buy: {} + gas: {})",
+                wallet_balance, required_balance, sol_amount, GAS_RESERVE_LAMPORTS
+            ));
+        }
+
+        log::info!("Wallet balance is sufficient for buy operation");
 
         let current_price = self.calculate_price_from_pool(trade_info);
         log::info!("Current price before buy: {} SOL/token", current_price);
