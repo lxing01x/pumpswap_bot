@@ -87,9 +87,11 @@ impl TradingStrategy {
         log::info!("Bot will monitor price changes and execute trades based on configured thresholds.");
         
         log::info!("Prefetching TradeInfo for target mint...");
-        let trader = self.trader.lock().unwrap();
-        let trade_info = trader.fetch_trade_info_with_retry(&self.target_mint).await
-            .context("Failed to prefetch TradeInfo")?;
+        let trade_info = {
+            let trader = self.trader.lock().unwrap();
+            trader.fetch_trade_info_with_retry(&self.target_mint).await
+                .context("Failed to prefetch TradeInfo")?
+        };
         
         log::info!("Successfully prefetched TradeInfo:");
         log::info!("  Pool: {}", trade_info.pool);
