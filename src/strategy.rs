@@ -143,6 +143,13 @@ impl TradingStrategy {
         let mint = trade_info.base_mint.to_string();
         let trader = self.trader.lock().unwrap();
         
+        self.store_pool_price_record(
+            &mint,
+            trade_info.pool_base_token_reserves,
+            trade_info.pool_quote_token_reserves,
+            true,
+        ).await?;
+        
         let current_price = self.get_current_price(&mint, &trade_info, &trader).await?;
         log::info!("Current price: {} SOL/token", current_price);
 
@@ -220,6 +227,13 @@ impl TradingStrategy {
         let mint = trade_info.base_mint.to_string();
         let trader = self.trader.lock().unwrap();
         
+        self.store_pool_price_record(
+            &mint,
+            trade_info.pool_base_token_reserves,
+            trade_info.pool_quote_token_reserves,
+            false,
+        ).await?;
+        
         let current_price = self.get_current_price(&mint, &trade_info, &trader).await?;
         
         if let Some(profit_pct) = trader.calculate_profit_loss_pct(current_price) {
@@ -268,6 +282,40 @@ impl TradingStrategy {
             } else {
                 log::info!("Stored transaction: signature={}, token_amount={}, sol_amount={}, blocktime_us={}", 
                     signature, token_amount, sol_amount, blocktime_us);
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn store_pool_price_record(
+        &self,
+        mint: &str,
+        base_reserves: u64,
+        quote_reserves: u64,
+        is_buy: bool,
+    ) -> Result<()> {
+        let redis_store = self.redis_store.lock().unwrap();
+        
+        if let Some(store) = redis_store.as_ref() {
+            let blocktime_us = chrono::Utc::now().timestamp_micros();
+            let signature = format!("pool_{}", blocktime_us);
+            
+            let record = TokenTradeRecord::from_pool_price(
+                mint,
+                base_reserves,
+                quote_reserves,
+                is_buy,
+                &signature,
+                blocktime_us,
+            );
+            
+            if let Err(e) = store.store_trade(mint, &record).await {
+                log::warn!("Failed to store pool price record: {}", e);
+            } else {
+                let price = record.effective_price();
+                log::debug!("Stored pool price record: price={:.9} SOL/token, base_reserves={}, quote_reserves={}", 
+                    price, base_reserves, quote_reserves);
             }
         }
         
