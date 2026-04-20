@@ -5,14 +5,15 @@ edition = "2021"
 
 [dependencies]
 sol-trade-sdk = "4.0.3"
-solana-sdk = "2"
-solana-client = "2"
-solana-account-decoder = "2"
-solana-program = "2"
-solana-keypair = "3"
+solana-streamer-sdk = "0.5.0"
+solana-sdk = "3.0.0"
+solana-client = "3.1.12"
+solana-account-decoder = "3.1.12"
+solana-program = "3.0.0"
+solana-keypair = "3.0.0"
 solana-address = "2"
-solana-commitment-config = "3"
-solana-hash = "4"
+solana-commitment-config = { version = "3.1.1", features = ["serde"] }
+solana-hash = "3.0.0"
 spl-associated-token-account = "8"
 spl-token = "7"
 
@@ -29,13 +30,6 @@ env_logger = "0.11"
 url = "2.5"
 chrono = "0.4"
 
-yellowstone-grpc-proto = { version = "5", features = ["tonic"] }
-tonic = { version = "0.12", features = ["tls", "transport", "tls-roots"] }
-rustls = "0.23"
-rustls-native-certs = "0.8"
-rustls-pemfile = "2.2"
-webpki-roots = "1.0"
-prost = "0.13"
 redis = { version = "0.24", features = ["tokio-comp"] }
 bs58 = "0.5"
-tokio-stream = "0.1"
+openssl = { version = "0.10", features = ["vendored"] }

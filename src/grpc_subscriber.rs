@@ -1,16 +1,19 @@
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
-use std::error::Error;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
-use tonic::{metadata::MetadataValue, Request, transport::ClientTlsConfig};
-use yellowstone_grpc_proto::geyser::*;
-use yellowstone_grpc_proto::prelude::CommitmentLevel;
-use yellowstone_grpc_proto::prelude::geyser_client::GeyserClient;
+use tokio::sync::Mutex;
 
-pub const PUMPSWAP_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+use solana_streamer_sdk::streaming::event_parser::{
+    common::filter::EventTypeFilter,
+    common::EventType,
+    protocols::pumpswap::PumpSwapBuyEvent,
+    protocols::pumpswap::PumpSwapSellEvent,
+    Protocol, UnifiedEvent,
+};
+use solana_streamer_sdk::streaming::yellowstone_grpc::{AccountFilter, TransactionFilter};
+use solana_streamer_sdk::streaming::YellowstoneGrpc;
+use solana_streamer_sdk::match_event;
 
 #[derive(Debug, Clone)]
 pub struct TransactionUpdate {
@@ -44,6 +47,8 @@ impl GrpcSubscriber {
         let grpc_token = self.grpc_token.clone();
         let target_mint = self.target_mint;
         
+        let tx = Arc::new(Mutex::new(tx));
+        
         tokio::spawn(async move {
             if let Err(e) = Self::run_subscription(grpc_url, grpc_token, target_mint, tx).await {
                 log::error!("gRPC subscription error: {:?}", e);
@@ -57,15 +62,14 @@ impl GrpcSubscriber {
         grpc_url: String,
         grpc_token: Option<String>,
         target_mint: Pubkey,
-        tx: mpsc::UnboundedSender<TransactionUpdate>,
+        tx: Arc<Mutex<mpsc::UnboundedSender<TransactionUpdate>>>,
     ) -> Result<()> {
         log::info!("Connecting to gRPC: {}", grpc_url);
         
         match &grpc_token {
             Some(token) => {
                 if token.is_empty() {
-                    log::warn!("gRPC token is empty! The service may require a valid token.");
-                    log::warn!("Get a token from: https://www.allnodes.com/publicnode");
+                    log::warn!("gRPC token is empty!");
                 } else {
                     log::info!("gRPC token is configured (length: {})", token.len());
                     log::debug!("Token preview: {}...", &token[..token.len().min(8)]);
@@ -74,363 +78,189 @@ impl GrpcSubscriber {
             None => {
                 log::warn!("gRPC token is not configured!");
                 log::warn!("The Solana Yellowstone gRPC service requires a personal token.");
-                log::warn!("Get a token from: https://www.allnodes.com/publicnode");
-                log::warn!("Add 'grpc_token' field to your config.json");
             }
         }
         
-        let endpoint_url = if grpc_url.starts_with("http") {
-            grpc_url.clone()
-        } else {
-            format!("https://{}", grpc_url)
-        };
-        
-        log::info!("Using endpoint URL: {}", endpoint_url);
-        
-        let mut endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url.clone()) {
-            Ok(ep) => ep,
-            Err(e) => {
-                log::error!("Failed to create gRPC endpoint from URL {}: {:?}", endpoint_url, e);
-                return Err(anyhow::anyhow!("Failed to create gRPC endpoint: {:?}", e));
-            }
-        };
-        
-        endpoint = endpoint
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .keep_alive_while_idle(true)
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(60))
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        
-        if endpoint_url.starts_with("https") {
-            log::info!("Configuring TLS for gRPC connection...");
-            let domain = endpoint_url
-                .trim_start_matches("https://")
-                .split(':')
-                .next()
-                .unwrap_or("");
-            
-            log::info!("TLS domain: {}", domain);
-            
-            let tls_config = ClientTlsConfig::new()
-                .with_enabled_roots()
-                .domain_name(domain);
-            
-            endpoint = endpoint.tls_config(tls_config)
-                .map_err(|e| {
-                    log::error!("Failed to configure TLS: {:?}", e);
-                    anyhow::anyhow!("TLS config error: {:?}", e)
-                })?;
-        }
-        
-        log::info!("Connecting to gRPC endpoint...");
-        
-        let channel = match endpoint.connect().await {
-            Ok(ch) => {
-                log::info!("Successfully connected to gRPC");
-                ch
+        let grpc = match YellowstoneGrpc::new(grpc_url.clone(), grpc_token) {
+            Ok(g) => {
+                log::info!("Successfully created YellowstoneGrpc client");
+                g
             }
             Err(e) => {
-                log::error!("Failed to connect to gRPC: {:?}", e);
-                return Err(anyhow::anyhow!("Failed to connect to gRPC: {:?}", e));
+                log::error!("Failed to create YellowstoneGrpc client: {:?}", e);
+                return Err(anyhow::anyhow!("Failed to create YellowstoneGrpc client: {:?}", e));
             }
         };
-
-        let token_clone = grpc_token.clone();
-        log::info!("Setting up gRPC interceptor with token...");
         
-        let interceptor = move |mut req: Request<()>| {
-            match &token_clone {
-                Some(token) if !token.is_empty() => {
-                    let bearer_token = format!("Bearer {}", token);
-                    log::debug!("Adding x-token header to gRPC request");
-                    
-                    let token_metadata: MetadataValue<_> = match bearer_token.parse() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            log::error!("Failed to parse token: {:?}", e);
-                            return Err(tonic::Status::internal("Invalid token"));
-                        }
-                    };
-                    req.metadata_mut().insert("x-token", token_metadata);
-                }
-                _ => {
-                    log::warn!("No valid token configured, gRPC request may be rejected");
-                }
-            }
-            Ok(req)
-        };
-
-        let mut client = GeyserClient::with_interceptor(channel, interceptor);
+        let protocols = vec![Protocol::PumpSwap];
         
-        client = client
-            .max_decoding_message_size(1024 * 1024 * 100)
-            .max_encoding_message_size(1024 * 1024 * 100);
-
-        log::info!("gRPC client created. Subscribing to transactions...");
-        log::info!("Target mint: {}", target_mint);
-        log::info!("PumpSwap program ID: {}", PUMPSWAP_PROGRAM_ID);
-
-        let mut transactions_filter = HashMap::new();
-        transactions_filter.insert(
-            "pumpswap".to_string(),
-            SubscribeRequestFilterTransactions {
-                vote: Some(false),
-                failed: Some(false),
-                signature: None,
-                account_include: vec![
-                    PUMPSWAP_PROGRAM_ID.to_string(),
-                    target_mint.to_string(),
-                ],
-                account_exclude: vec![],
-                account_required: vec![],
-            },
-        );
-
-        let subscribe_request = SubscribeRequest {
-            accounts: HashMap::new(),
-            slots: HashMap::new(),
-            transactions: transactions_filter,
-            transactions_status: HashMap::new(),
-            blocks: HashMap::new(),
-            blocks_meta: HashMap::new(),
-            entry: HashMap::new(),
-            commitment: Some(CommitmentLevel::Processed as i32),
-            accounts_data_slice: vec![],
-            ping: None,
-            from_slot: None,
+        let account_include = vec![
+            solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::parser::PUMPSWAP_PROGRAM_ID.to_string(),
+        ];
+        let account_exclude = vec![];
+        let account_required = vec![];
+        
+        log::info!("Account filter - include: {:?}", account_include);
+        
+        let transaction_filter = TransactionFilter {
+            account_include: account_include.clone(),
+            account_exclude,
+            account_required,
         };
-
-        log::info!("Subscribe request created. Accounts to filter:");
-        log::info!("  - PumpSwap program: {}", PUMPSWAP_PROGRAM_ID);
+        
+        let account_filter = AccountFilter { account: vec![], owner: vec![], filters: vec![] };
+        
+        let event_type_filter = EventTypeFilter {
+            include: vec![EventType::PumpSwapBuy, EventType::PumpSwapSell],
+        };
+        
+        log::info!("Subscribing to PumpSwap events...");
+        log::info!("  - Protocols: {:?}", protocols);
+        log::info!("  - Event types: PumpSwapBuy, PumpSwapSell");
         log::info!("  - Target mint: {}", target_mint);
         
-        let (subscribe_tx, subscribe_rx) = mpsc::unbounded_channel();
-        
-        if let Err(e) = subscribe_tx.send(subscribe_request) {
-            log::error!("Failed to send subscribe request to channel: {:?}", e);
-            return Err(anyhow::anyhow!("Failed to send subscribe request: {:?}", e));
-        }
-
-        log::info!("Calling subscribe() on gRPC client...");
-        
-        let request = Request::new(tokio_stream::wrappers::UnboundedReceiverStream::new(subscribe_rx));
-        
-        log::debug!("Sending subscribe request...");
-        
-        let response = match client.subscribe(request).await {
-            Ok(resp) => {
-                log::info!("Subscribe response received successfully");
-                resp
-            }
-            Err(e) => {
-                log::error!("Failed to subscribe to gRPC stream: {:?}", e);
-                log::error!("Error code: {:?}", e.code());
-                log::error!("Error message: {}", e.message());
-                log::error!("Error details: {:?}", e.details());
-                
-                if e.code() == tonic::Code::PermissionDenied {
-                    log::error!("====================================================================");
-                    log::error!("PERMISSION DENIED: The gRPC service requires a valid personal token.");
-                    log::error!("====================================================================");
-                    log::error!("");
-                    log::error!("SOLUTION:");
-                    log::error!("  1. Go to: https://www.allnodes.com/publicnode");
-                    log::error!("  2. Sign up or log in");
-                    log::error!("  3. Get your personal API token");
-                    log::error!("  4. Add the token to your config.json:");
-                    log::error!("");
-                    log::error!("    {{");
-                    log::error!("      ...");
-                    log::error!("      \"grpc_token\": \"your-token-here\"");
-                    log::error!("      ...");
-                    log::error!("    }}");
-                    log::error!("");
-                    log::error!("====================================================================");
-                }
-                
-                if let Some(source) = e.source() {
-                    log::error!("Error source: {:?}", source);
-                }
-                return Err(anyhow::anyhow!("Failed to subscribe to gRPC stream: {:?}", e));
-            }
+        let tx_clone = tx.clone();
+        let callback = move |event: Box<dyn UnifiedEvent>| {
+            let tx = tx_clone.clone();
+            tokio::spawn(async move {
+                Self::handle_event(event, target_mint, tx).await;
+            });
         };
-
-        let mut stream = response.into_inner();
-
-        log::info!("gRPC subscription started. Waiting for transactions...");
-
-        loop {
-            match stream.message().await {
-                Ok(Some(message)) => {
-                    log::debug!("Received gRPC message with filters: {:?}", message.filters);
-                    
-                    if let Some(subscribe_update::UpdateOneof::Transaction(transaction_update)) = message.update_oneof {
-                        log::info!("Received transaction update from slot: {}", transaction_update.slot);
-                        Self::process_transaction_update(transaction_update, &target_mint, &tx);
-                    } else {
-                        log::debug!("Received non-transaction update");
-                    }
-                }
-                Ok(None) => {
-                    log::warn!("gRPC stream ended (received None)");
-                    break;
-                }
-                Err(e) => {
-                    log::error!("Error receiving from gRPC stream: {:?}", e);
-                    log::error!("Error code: {:?}", e.code());
-                    log::error!("Error message: {}", e.message());
-                    return Err(anyhow::anyhow!("gRPC stream error: {:?}", e));
-                }
-            }
+        
+        if let Err(e) = grpc.subscribe_events_immediate(
+            protocols,
+            None,
+            vec![transaction_filter],
+            vec![account_filter],
+            Some(event_type_filter),
+            None,
+            callback,
+        )
+        .await {
+            log::error!("Failed to subscribe to gRPC events: {:?}", e);
+            return Err(anyhow::anyhow!("Failed to subscribe to gRPC events: {:?}", e));
         }
-
-        log::warn!("gRPC subscription loop ended");
-        Ok(())
+        
+        log::info!("gRPC subscription started successfully");
+        log::info!("Waiting for PumpSwap events...");
+        
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
     }
 
-    fn process_transaction_update(
-        transaction_update: SubscribeUpdateTransaction,
-        target_mint: &Pubkey,
-        tx: &mpsc::UnboundedSender<TransactionUpdate>,
+    async fn handle_event(
+        event: Box<dyn UnifiedEvent>,
+        target_mint: Pubkey,
+        tx: Arc<Mutex<mpsc::UnboundedSender<TransactionUpdate>>>,
     ) {
-        let slot = transaction_update.slot;
-        let blocktime_us = chrono::Utc::now().timestamp_micros();
-
-        if let Some(transaction_info) = &transaction_update.transaction {
-            let signature = if !transaction_info.signature.is_empty() {
-                bs58::encode(&transaction_info.signature).into_string()
-            } else {
-                log::debug!("Transaction update without signature");
-                return;
-            };
-
-            log::info!("Processing transaction: {} at slot {}", signature, slot);
-
-            if let Some(meta) = &transaction_info.meta {
-                if meta.err.is_some() {
-                    log::debug!("Skipping failed transaction: {}", signature);
+        match_event!(event, {
+            PumpSwapBuyEvent => |e: PumpSwapBuyEvent| {
+                log::debug!("Received PumpSwapBuyEvent");
+                
+                if e.base_mint != target_mint && e.quote_mint != target_mint {
+                    log::debug!("Event not for target mint: base={}, quote={}, target={}", 
+                        e.base_mint, e.quote_mint, target_mint);
                     return;
                 }
-
-                if let Some(update) = Self::extract_trade_from_meta(
-                    meta,
-                    &transaction_info.transaction,
-                    target_mint,
-                    &signature,
+                
+                let mint = if e.base_mint == target_mint {
+                    e.base_mint
+                } else {
+                    e.quote_mint
+                };
+                
+                let is_wsol = e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT 
+                    || e.quote_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
+                
+                if !is_wsol {
+                    log::debug!("Event not involving WSOL: base={}, quote={}", e.base_mint, e.quote_mint);
+                    return;
+                }
+                
+                let (token_amount, sol_amount) = if e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT {
+                    (e.pool_quote_token_reserves, e.pool_base_token_reserves)
+                } else {
+                    (e.pool_base_token_reserves, e.pool_quote_token_reserves)
+                };
+                
+                let blocktime_us = e.timestamp as i64 * 1_000_000; // timestamp is in seconds, convert to microseconds
+                let signature = e.signature().to_string();
+                
+                log::info!(
+                    "PumpSwap BUY event: mint={}, token_amount={}, sol_amount={}, signature={}, timestamp={}, blocktime_us={}",
+                    mint, token_amount, sol_amount, signature, e.timestamp, blocktime_us
+                );
+                
+                let update = TransactionUpdate {
+                    mint: mint.to_string(),
+                    token_amount,
+                    sol_amount,
+                    is_buy: true,
+                    signature,
                     blocktime_us,
-                ) {
-                    log::info!("Extracted trade update: {:?}", update);
-                    
+                };
+                
+                tokio::spawn(async move {
+                    let tx = tx.lock().await;
                     if let Err(e) = tx.send(update) {
                         log::error!("Failed to send transaction update: {}", e);
                     }
-                } else {
-                    log::debug!("No trade extracted from transaction: {}", signature);
-                }
-            } else {
-                log::debug!("No meta in transaction info: {}", signature);
-            }
-        } else {
-            log::debug!("No transaction info in update at slot {}", slot);
-        }
-    }
-
-    fn extract_trade_from_meta(
-        meta: &yellowstone_grpc_proto::solana::storage::confirmed_block::TransactionStatusMeta,
-        _transaction: &Option<yellowstone_grpc_proto::solana::storage::confirmed_block::Transaction>,
-        target_mint: &Pubkey,
-        signature: &str,
-        blocktime_us: i64,
-    ) -> Option<TransactionUpdate> {
-        let pre_token_balances = &meta.pre_token_balances;
-        let post_token_balances = &meta.post_token_balances;
-        let pre_balances = &meta.pre_balances;
-        let post_balances = &meta.post_balances;
-
-        let target_mint_str = target_mint.to_string();
-
-        log::debug!("Pre token balances count: {}", pre_token_balances.len());
-        log::debug!("Post token balances count: {}", post_token_balances.len());
-
-        let mut target_pre_balance: Option<u64> = None;
-        let mut target_post_balance: Option<u64> = None;
-
-        for balance in pre_token_balances {
-            log::debug!("Pre balance - mint: {}, owner: {:?}", balance.mint, balance.owner);
-            if balance.mint == target_mint_str {
-                if let Some(ui_amt) = &balance.ui_token_amount {
-                    if let Ok(amt) = ui_amt.amount.parse::<u64>() {
-                        target_pre_balance = Some(amt);
-                        log::debug!("Found target pre balance: {}", amt);
-                    }
-                }
-            }
-        }
-
-        for balance in post_token_balances {
-            log::debug!("Post balance - mint: {}, owner: {:?}", balance.mint, balance.owner);
-            if balance.mint == target_mint_str {
-                if let Some(ui_amt) = &balance.ui_token_amount {
-                    if let Ok(amt) = ui_amt.amount.parse::<u64>() {
-                        target_post_balance = Some(amt);
-                        log::debug!("Found target post balance: {}", amt);
-                    }
-                }
-            }
-        }
-
-        let mut sol_change: i128 = 0;
-        
-        for (i, (pre, post)) in pre_balances.iter().zip(post_balances.iter()).enumerate() {
-            if pre != post {
-                let change = *post as i128 - *pre as i128;
-                sol_change += change;
-                log::debug!("Account {} SOL change: {} (pre={}, post={})", i, change, pre, post);
-            }
-        }
-
-        log::debug!("Total SOL change: {}", sol_change);
-        log::debug!("Target pre balance: {:?}", target_pre_balance);
-        log::debug!("Target post balance: {:?}", target_post_balance);
-
-        match (target_pre_balance, target_post_balance) {
-            (Some(pre), Some(post)) if pre != post => {
-                let token_change = post as i128 - pre as i128;
-                let is_buy = token_change > 0;
-                let token_amount = token_change.unsigned_abs() as u64;
+                });
+            },
+            PumpSwapSellEvent => |e: PumpSwapSellEvent| {
+                log::debug!("Received PumpSwapSellEvent");
                 
-                let sol_amount = if sol_change < 0 {
-                    (-sol_change) as u64
-                } else {
-                    sol_change as u64
-                };
-
-                if token_amount > 0 && sol_amount > 0 {
-                    log::info!(
-                        "Detected trade: signature={}, is_buy={}, token_amount={}, sol_amount={}",
-                        signature, is_buy, token_amount, sol_amount
-                    );
-                    
-                    Some(TransactionUpdate {
-                        mint: target_mint_str,
-                        token_amount,
-                        sol_amount,
-                        is_buy,
-                        signature: signature.to_string(),
-                        blocktime_us,
-                    })
-                } else {
-                    log::debug!("Token amount or SOL amount is zero: token_amount={}, sol_amount={}", token_amount, sol_amount);
-                    None
+                if e.base_mint != target_mint && e.quote_mint != target_mint {
+                    log::debug!("Event not for target mint: base={}, quote={}, target={}", 
+                        e.base_mint, e.quote_mint, target_mint);
+                    return;
                 }
+                
+                let mint = if e.base_mint == target_mint {
+                    e.base_mint
+                } else {
+                    e.quote_mint
+                };
+                
+                let is_wsol = e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT 
+                    || e.quote_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
+                
+                if !is_wsol {
+                    log::debug!("Event not involving WSOL: base={}, quote={}", e.base_mint, e.quote_mint);
+                    return;
+                }
+                
+                let (token_amount, sol_amount) = if e.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT {
+                    (e.pool_quote_token_reserves, e.pool_base_token_reserves)
+                } else {
+                    (e.pool_base_token_reserves, e.pool_quote_token_reserves)
+                };
+                
+                let blocktime_us = e.timestamp as i64 * 1_000_000; // timestamp is in seconds, convert to microseconds
+                let signature = e.signature().to_string();
+                
+                log::info!(
+                    "PumpSwap SELL event: mint={}, token_amount={}, sol_amount={}, signature={}, timestamp={}, blocktime_us={}",
+                    mint, token_amount, sol_amount, signature, e.timestamp, blocktime_us
+                );
+                
+                let update = TransactionUpdate {
+                    mint: mint.to_string(),
+                    token_amount,
+                    sol_amount,
+                    is_buy: false,
+                    signature,
+                    blocktime_us,
+                };
+                
+                tokio::spawn(async move {
+                    let tx = tx.lock().await;
+                    if let Err(e) = tx.send(update) {
+                        log::error!("Failed to send transaction update: {}", e);
+                    }
+                });
             }
-            _ => {
-                log::debug!("No token balance change for target mint");
-                None
-            }
-        }
+        });
     }
 }
