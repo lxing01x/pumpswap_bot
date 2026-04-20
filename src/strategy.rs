@@ -132,57 +132,35 @@ impl TradingStrategy {
     }
 
     async fn check_buy_condition(&self) -> Result<()> {
-        let trade_info = match self.get_latest_trade_info() {
-            Some(info) => info,
-            None => {
-                log::warn!("No TradeInfo available for buy condition check");
-                return Ok(());
+        let mint = self.target_mint.to_string();
+        
+        let current_price = self.get_latest_trade_price(&mint).await?;
+        
+        if let Some(price) = current_price {
+            log::info!("Current price: {} SOL/token", price);
+
+            let should_buy = self.check_price_increase(&mint).await?;
+            
+            if should_buy {
+                log::info!("Buy condition met! Starting buy operation...");
+                self.execute_buy().await?;
             }
-        };
-
-        let mint = trade_info.base_mint.to_string();
-        let trader = self.trader.lock().unwrap();
-        
-        self.store_pool_price_record(
-            &mint,
-            trade_info.pool_base_token_reserves,
-            trade_info.pool_quote_token_reserves,
-            true,
-        ).await?;
-        
-        let current_price = self.get_current_price(&mint, &trade_info, &trader).await?;
-        log::info!("Current price: {} SOL/token", current_price);
-
-        let should_buy = self.check_price_increase(&mint).await?;
-        
-        drop(trader);
-        
-        if should_buy {
-            log::info!("Buy condition met! Starting buy operation...");
-            self.execute_buy().await?;
+        } else {
+            log::info!("Waiting for trade data from gRPC...");
         }
         
         Ok(())
     }
 
-    async fn get_current_price(
-        &self,
-        mint: &str,
-        trade_info: &TradeInfo,
-        trader: &Trader,
-    ) -> Result<f64> {
+    async fn get_latest_trade_price(&self, mint: &str) -> Result<Option<f64>> {
         let redis_store = self.redis_store.lock().unwrap();
         
         if let Some(store) = redis_store.as_ref() {
-            if let Some(latest_price) = store.get_latest_price_from_trades(mint).await? {
-                log::debug!("Using price from latest trade: {} SOL/token", latest_price);
-                return Ok(latest_price);
-            }
+            store.get_latest_price_from_trades(mint).await
+        } else {
+            log::warn!("Redis not available, cannot get trade price");
+            Ok(None)
         }
-        
-        let pool_price = trader.calculate_price_from_pool(trade_info);
-        log::debug!("Using price from pool reserves: {} SOL/token", pool_price);
-        Ok(pool_price)
     }
 
     async fn check_price_increase(&self, mint: &str) -> Result<bool> {
@@ -216,41 +194,31 @@ impl TradingStrategy {
     }
 
     async fn check_sell_condition(&self) -> Result<()> {
-        let trade_info = match self.get_latest_trade_info() {
-            Some(info) => info,
-            None => {
-                log::warn!("No TradeInfo available for sell condition check");
-                return Ok(());
+        let mint = self.target_mint.to_string();
+        
+        let current_price = self.get_latest_trade_price(&mint).await?;
+        
+        if let Some(price) = current_price {
+            let trader = self.trader.lock().unwrap();
+            
+            if let Some(profit_pct) = trader.calculate_profit_loss_pct(price) {
+                log::info!("Current price: {} SOL/token, P/L: {:.2}%", price, profit_pct);
             }
-        };
 
-        let mint = trade_info.base_mint.to_string();
-        let trader = self.trader.lock().unwrap();
-        
-        self.store_pool_price_record(
-            &mint,
-            trade_info.pool_base_token_reserves,
-            trade_info.pool_quote_token_reserves,
-            false,
-        ).await?;
-        
-        let current_price = self.get_current_price(&mint, &trade_info, &trader).await?;
-        
-        if let Some(profit_pct) = trader.calculate_profit_loss_pct(current_price) {
-            log::info!("Current price: {} SOL/token, P/L: {:.2}%", current_price, profit_pct);
-        }
-
-        let should_sell = trader.should_sell(
-            current_price,
-            self.config.sell_profit_pct,
-            self.config.sell_stop_loss_pct,
-        );
-        
-        drop(trader);
-        
-        if should_sell {
-            log::info!("Sell condition met! Starting sell operation...");
-            self.execute_sell().await?;
+            let should_sell = trader.should_sell(
+                price,
+                self.config.sell_profit_pct,
+                self.config.sell_stop_loss_pct,
+            );
+            
+            drop(trader);
+            
+            if should_sell {
+                log::info!("Sell condition met! Starting sell operation...");
+                self.execute_sell().await?;
+            }
+        } else {
+            log::info!("Waiting for trade data from gRPC...");
         }
         
         Ok(())
@@ -282,40 +250,6 @@ impl TradingStrategy {
             } else {
                 log::info!("Stored transaction: signature={}, token_amount={}, sol_amount={}, blocktime_us={}", 
                     signature, token_amount, sol_amount, blocktime_us);
-            }
-        }
-        
-        Ok(())
-    }
-
-    async fn store_pool_price_record(
-        &self,
-        mint: &str,
-        base_reserves: u64,
-        quote_reserves: u64,
-        is_buy: bool,
-    ) -> Result<()> {
-        let redis_store = self.redis_store.lock().unwrap();
-        
-        if let Some(store) = redis_store.as_ref() {
-            let blocktime_us = chrono::Utc::now().timestamp_micros();
-            let signature = format!("pool_{}", blocktime_us);
-            
-            let record = TokenTradeRecord::from_pool_price(
-                mint,
-                base_reserves,
-                quote_reserves,
-                is_buy,
-                &signature,
-                blocktime_us,
-            );
-            
-            if let Err(e) = store.store_trade(mint, &record).await {
-                log::warn!("Failed to store pool price record: {}", e);
-            } else {
-                let price = record.effective_price();
-                log::debug!("Stored pool price record: price={:.9} SOL/token, base_reserves={}, quote_reserves={}", 
-                    price, base_reserves, quote_reserves);
             }
         }
         
