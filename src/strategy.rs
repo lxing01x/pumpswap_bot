@@ -226,15 +226,12 @@ impl TradingStrategy {
         let redis_store = self.redis_store.lock().unwrap();
         
         if let Some(store) = redis_store.as_ref() {
-            let sol_amount = if is_buy { self.config.buy_amount_lamports() } else { 1_000_000 };
-            let token_amount = (price * sol_amount as f64) as u64;
-            
-            let record = TokenTradeRecord::new(mint, token_amount, sol_amount, is_buy);
+            let record = TokenTradeRecord::with_price(mint, price, is_buy);
             
             if let Err(e) = store.store_trade(mint, &record).await {
                 log::warn!("Failed to store trade record: {}", e);
             } else {
-                log::debug!("Stored trade record for {}: price={}, is_buy={}", mint, price, is_buy);
+                log::debug!("Stored trade record for {}: price={} SOL/token, is_buy={}", mint, price, is_buy);
             }
         }
         

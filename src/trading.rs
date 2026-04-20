@@ -61,8 +61,8 @@ pub struct TokenTradeRecord {
 
 impl TokenTradeRecord {
     pub fn new(mint: &str, token_amount: u64, sol_amount: u64, is_buy: bool) -> Self {
-        let price = if sol_amount > 0 {
-            token_amount as f64 / sol_amount as f64
+        let price = if token_amount > 0 {
+            sol_amount as f64 / token_amount as f64
         } else {
             0.0
         };
@@ -70,6 +70,17 @@ impl TokenTradeRecord {
             mint: mint.to_string(),
             token_amount,
             sol_amount,
+            price,
+            timestamp: Utc::now().timestamp(),
+            is_buy,
+        }
+    }
+
+    pub fn with_price(mint: &str, price: f64, is_buy: bool) -> Self {
+        Self {
+            mint: mint.to_string(),
+            token_amount: 0,
+            sol_amount: 0,
             price,
             timestamp: Utc::now().timestamp(),
             is_buy,
@@ -509,10 +520,10 @@ impl Trader {
         let base_reserves = trade_info.pool_base_token_reserves as f64;
         let quote_reserves = trade_info.pool_quote_token_reserves as f64;
         
-        if quote_reserves == 0.0 {
+        if base_reserves == 0.0 {
             0.0
         } else {
-            base_reserves / quote_reserves
+            quote_reserves / base_reserves
         }
     }
 
@@ -554,7 +565,7 @@ impl Trader {
         log::info!("Is cashback coin: {}", trade_info.is_cashback_coin);
 
         let current_price = self.calculate_price_from_pool(trade_info);
-        log::info!("Current price before buy: {} token/SOL", current_price);
+        log::info!("Current price before buy: {} SOL/token", current_price);
 
         let gas_fee_strategy = GasFeeStrategy::new();
         gas_fee_strategy.set_global_fee_strategy(
