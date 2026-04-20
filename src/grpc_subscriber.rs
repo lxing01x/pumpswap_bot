@@ -1,8 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
+use std::error::Error;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tonic::{metadata::MetadataValue, Request};
+use tonic::{metadata::MetadataValue, Request, transport::ClientTlsConfig};
 use yellowstone_grpc_proto::geyser::*;
 use yellowstone_grpc_proto::prelude::CommitmentLevel;
 use yellowstone_grpc_proto::prelude::geyser_client::GeyserClient;
@@ -66,7 +68,7 @@ impl GrpcSubscriber {
         
         log::info!("Using endpoint URL: {}", endpoint_url);
         
-        let endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url.clone()) {
+        let mut endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url.clone()) {
             Ok(ep) => ep,
             Err(e) => {
                 log::error!("Failed to create gRPC endpoint from URL {}: {:?}", endpoint_url, e);
@@ -74,11 +76,35 @@ impl GrpcSubscriber {
             }
         };
         
-        let endpoint = endpoint
-            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+        endpoint = endpoint
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .keep_alive_while_idle(true)
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(60));
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+        
+        if endpoint_url.starts_with("https") {
+            log::info!("Configuring TLS for gRPC connection...");
+            let domain = endpoint_url
+                .trim_start_matches("https://")
+                .split(':')
+                .next()
+                .unwrap_or("");
+            
+            log::info!("TLS domain: {}", domain);
+            
+            let tls_config = ClientTlsConfig::new()
+                .with_enabled_roots()
+                .domain_name(domain);
+            
+            endpoint = endpoint.tls_config(tls_config)
+                .map_err(|e| {
+                    log::error!("Failed to configure TLS: {:?}", e);
+                    anyhow::anyhow!("TLS config error: {:?}", e)
+                })?;
+        }
         
         log::info!("Connecting to gRPC endpoint...");
         
@@ -96,13 +122,23 @@ impl GrpcSubscriber {
         let token_clone = grpc_token.clone();
         let interceptor = move |mut req: Request<()>| {
             if let Some(ref token) = token_clone {
-                let token: MetadataValue<_> = format!("Bearer {}", token).parse().unwrap();
+                let token: MetadataValue<_> = match format!("Bearer {}", token).parse() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::error!("Failed to parse token: {:?}", e);
+                        return Err(tonic::Status::internal("Invalid token"));
+                    }
+                };
                 req.metadata_mut().insert("x-token", token);
             }
             Ok(req)
         };
 
         let mut client = GeyserClient::with_interceptor(channel, interceptor);
+        
+        client = client
+            .max_decoding_message_size(1024 * 1024 * 100)
+            .max_encoding_message_size(1024 * 1024 * 100);
 
         log::info!("gRPC client created. Subscribing to transactions...");
         log::info!("Target mint: {}", target_mint);
@@ -110,14 +146,14 @@ impl GrpcSubscriber {
 
         let mut transactions_filter = HashMap::new();
         transactions_filter.insert(
-            "target".to_string(),
+            "pumpswap".to_string(),
             SubscribeRequestFilterTransactions {
                 vote: Some(false),
                 failed: Some(false),
                 signature: None,
                 account_include: vec![
-                    target_mint.to_string(),
                     PUMPSWAP_PROGRAM_ID.to_string(),
+                    target_mint.to_string(),
                 ],
                 account_exclude: vec![],
                 account_required: vec![],
@@ -138,7 +174,9 @@ impl GrpcSubscriber {
             from_slot: None,
         };
 
-        log::info!("Subscribe request created. Sending subscription request...");
+        log::info!("Subscribe request created. Accounts to filter:");
+        log::info!("  - PumpSwap program: {}", PUMPSWAP_PROGRAM_ID);
+        log::info!("  - Target mint: {}", target_mint);
         
         let (subscribe_tx, subscribe_rx) = mpsc::unbounded_channel();
         
@@ -149,17 +187,23 @@ impl GrpcSubscriber {
 
         log::info!("Calling subscribe() on gRPC client...");
         
-        let response = match client
-            .subscribe(Request::new(tokio_stream::wrappers::UnboundedReceiverStream::new(subscribe_rx)))
-            .await
-        {
+        let request = Request::new(tokio_stream::wrappers::UnboundedReceiverStream::new(subscribe_rx));
+        
+        log::debug!("Sending subscribe request...");
+        
+        let response = match client.subscribe(request).await {
             Ok(resp) => {
                 log::info!("Subscribe response received successfully");
                 resp
             }
             Err(e) => {
                 log::error!("Failed to subscribe to gRPC stream: {:?}", e);
-                log::error!("Error details: code={:?}, message={}", e.code(), e.message());
+                log::error!("Error code: {:?}", e.code());
+                log::error!("Error message: {}", e.message());
+                log::error!("Error details: {:?}", e.details());
+                if let Some(source) = e.source() {
+                    log::error!("Error source: {:?}", source);
+                }
                 return Err(anyhow::anyhow!("Failed to subscribe to gRPC stream: {:?}", e));
             }
         };
@@ -171,11 +215,13 @@ impl GrpcSubscriber {
         loop {
             match stream.message().await {
                 Ok(Some(message)) => {
-                    log::debug!("Received gRPC message: {:?}", message.filters);
+                    log::debug!("Received gRPC message with filters: {:?}", message.filters);
                     
                     if let Some(subscribe_update::UpdateOneof::Transaction(transaction_update)) = message.update_oneof {
                         log::info!("Received transaction update from slot: {}", transaction_update.slot);
                         Self::process_transaction_update(transaction_update, &target_mint, &tx);
+                    } else {
+                        log::debug!("Received non-transaction update");
                     }
                 }
                 Ok(None) => {
@@ -184,6 +230,8 @@ impl GrpcSubscriber {
                 }
                 Err(e) => {
                     log::error!("Error receiving from gRPC stream: {:?}", e);
+                    log::error!("Error code: {:?}", e.code());
+                    log::error!("Error message: {}", e.message());
                     return Err(anyhow::anyhow!("gRPC stream error: {:?}", e));
                 }
             }
@@ -198,7 +246,7 @@ impl GrpcSubscriber {
         target_mint: &Pubkey,
         tx: &mpsc::UnboundedSender<TransactionUpdate>,
     ) {
-        let _slot = transaction_update.slot;
+        let slot = transaction_update.slot;
         let blocktime_us = chrono::Utc::now().timestamp_micros();
 
         if let Some(transaction_info) = &transaction_update.transaction {
@@ -209,7 +257,7 @@ impl GrpcSubscriber {
                 return;
             };
 
-            log::info!("Processing transaction: {}", signature);
+            log::info!("Processing transaction: {} at slot {}", signature, slot);
 
             if let Some(meta) = &transaction_info.meta {
                 if meta.err.is_some() {
@@ -236,7 +284,7 @@ impl GrpcSubscriber {
                 log::debug!("No meta in transaction info: {}", signature);
             }
         } else {
-            log::debug!("No transaction info in update");
+            log::debug!("No transaction info in update at slot {}", slot);
         }
     }
 
@@ -261,7 +309,7 @@ impl GrpcSubscriber {
         let mut target_post_balance: Option<u64> = None;
 
         for balance in pre_token_balances {
-            log::debug!("Pre balance - mint: {}", balance.mint);
+            log::debug!("Pre balance - mint: {}, owner: {:?}", balance.mint, balance.owner);
             if balance.mint == target_mint_str {
                 if let Some(ui_amt) = &balance.ui_token_amount {
                     if let Ok(amt) = ui_amt.amount.parse::<u64>() {
@@ -273,7 +321,7 @@ impl GrpcSubscriber {
         }
 
         for balance in post_token_balances {
-            log::debug!("Post balance - mint: {}", balance.mint);
+            log::debug!("Post balance - mint: {}, owner: {:?}", balance.mint, balance.owner);
             if balance.mint == target_mint_str {
                 if let Some(ui_amt) = &balance.ui_token_amount {
                     if let Ok(amt) = ui_amt.amount.parse::<u64>() {
@@ -286,13 +334,15 @@ impl GrpcSubscriber {
 
         let mut sol_change: i128 = 0;
         
-        for (pre, post) in pre_balances.iter().zip(post_balances.iter()) {
+        for (i, (pre, post)) in pre_balances.iter().zip(post_balances.iter()).enumerate() {
             if pre != post {
-                sol_change += *post as i128 - *pre as i128;
+                let change = *post as i128 - *pre as i128;
+                sol_change += change;
+                log::debug!("Account {} SOL change: {} (pre={}, post={})", i, change, pre, post);
             }
         }
 
-        log::debug!("SOL change: {}", sol_change);
+        log::debug!("Total SOL change: {}", sol_change);
         log::debug!("Target pre balance: {:?}", target_pre_balance);
         log::debug!("Target post balance: {:?}", target_post_balance);
 
@@ -323,10 +373,14 @@ impl GrpcSubscriber {
                         blocktime_us,
                     })
                 } else {
+                    log::debug!("Token amount or SOL amount is zero: token_amount={}, sol_amount={}", token_amount, sol_amount);
                     None
                 }
             }
-            _ => None,
+            _ => {
+                log::debug!("No token balance change for target mint");
+                None
+            }
         }
     }
 }
