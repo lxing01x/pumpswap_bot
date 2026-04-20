@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::time::{sleep, Duration};
+use uuid::Uuid;
 
 use crate::config::BotConfig;
 use crate::trading::{Trader, TradeInfo, RedisStore, TokenTradeRecord};
@@ -144,7 +145,8 @@ impl TradingStrategy {
         let current_price = trader.calculate_price_from_pool(&trade_info);
         log::info!("Current price: {} token/SOL", current_price);
 
-        self.store_trade_record(&trade_info.base_mint.to_string(), current_price, true).await?;
+        let signature = Self::generate_temp_signature();
+        self.store_trade_record_with_price(&trade_info.base_mint.to_string(), current_price, true, &signature).await?;
 
         let should_buy = self.check_price_increase(&trade_info.base_mint.to_string()).await?;
         
@@ -204,7 +206,8 @@ impl TradingStrategy {
             log::info!("Current price: {} token/SOL, P/L: {:.2}%", current_price, profit_pct);
         }
 
-        self.store_trade_record(&trade_info.base_mint.to_string(), current_price, false).await?;
+        let signature = Self::generate_temp_signature();
+        self.store_trade_record_with_price(&trade_info.base_mint.to_string(), current_price, false, &signature).await?;
 
         let should_sell = trader.should_sell(
             current_price,
@@ -222,11 +225,49 @@ impl TradingStrategy {
         Ok(())
     }
 
-    async fn store_trade_record(&self, mint: &str, price: f64, is_buy: bool) -> Result<()> {
+    async fn store_trade_record_with_amounts(
+        &self,
+        mint: &str,
+        token_amount: u64,
+        sol_amount: u64,
+        is_buy: bool,
+        signature: &str,
+        blocktime_us: i64,
+    ) -> Result<()> {
         let redis_store = self.redis_store.lock().unwrap();
         
         if let Some(store) = redis_store.as_ref() {
-            let record = TokenTradeRecord::with_price(mint, price, is_buy);
+            let record = TokenTradeRecord::new(
+                mint,
+                token_amount,
+                sol_amount,
+                is_buy,
+                signature,
+                blocktime_us,
+            );
+            
+            if let Err(e) = store.store_trade(mint, &record).await {
+                log::warn!("Failed to store trade record: {}", e);
+            } else {
+                log::debug!("Stored trade record for {}: signature={}, token_amount={}, sol_amount={}", 
+                    mint, signature, token_amount, sol_amount);
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn store_trade_record_with_price(
+        &self,
+        mint: &str,
+        price: f64,
+        is_buy: bool,
+        signature: &str,
+    ) -> Result<()> {
+        let redis_store = self.redis_store.lock().unwrap();
+        
+        if let Some(store) = redis_store.as_ref() {
+            let record = TokenTradeRecord::with_price_now(mint, price, is_buy, signature);
             
             if let Err(e) = store.store_trade(mint, &record).await {
                 log::warn!("Failed to store trade record: {}", e);
@@ -236,6 +277,10 @@ impl TradingStrategy {
         }
         
         Ok(())
+    }
+
+    fn generate_temp_signature() -> String {
+        Uuid::new_v4().to_string()
     }
 
     async fn execute_buy(&self) -> Result<()> {
