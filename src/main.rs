@@ -1,6 +1,7 @@
 mod config;
 mod trading;
 mod strategy;
+mod grpc_subscriber;
 
 use anyhow::Result;
 use clap::Parser;

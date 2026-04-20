@@ -4042,6 +4042,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bs58",
  "chrono",
  "clap",
  "env_logger",
@@ -4064,6 +4065,7 @@ dependencies = [
  "spl-token 7.0.0",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tonic 0.12.3",
  "url",
  "yellowstone-grpc-proto",
