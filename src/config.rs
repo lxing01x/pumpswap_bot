@@ -34,6 +34,8 @@ pub struct BotConfig {
     pub buy_threshold_pct: f64,
     #[serde(default = "default_buy_time_window_sec")]
     pub buy_time_window_sec: u64,
+    #[serde(default = "default_buy_record_count")]
+    pub buy_record_count: usize,
     #[serde(default = "default_sell_profit_pct")]
     pub sell_profit_pct: f64,
     #[serde(default = "default_sell_stop_loss_pct")]
@@ -69,6 +71,10 @@ fn default_buy_threshold_pct() -> f64 {
 }
 
 fn default_buy_time_window_sec() -> u64 {
+    5
+}
+
+fn default_buy_record_count() -> usize {
     5
 }
 
