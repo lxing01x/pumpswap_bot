@@ -3,9 +3,11 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{sleep, Duration};
 
 use crate::config::BotConfig;
+use crate::grpc_subscriber::GrpcSubscriber;
 use crate::trading::{Trader, TradeInfo, RedisStore, TokenTradeRecord};
 
 pub const PUMPSWAP_PROGRAM_ID: &str = "SwaPpA9LAaLfeMiqDymXsF4U2oZd5fJtQZ48X7GjVfA";
@@ -17,7 +19,7 @@ pub struct TradingStrategy {
     executed: Arc<AtomicBool>,
     bought: Arc<AtomicBool>,
     latest_trade_info: Arc<Mutex<Option<TradeInfo>>>,
-    redis_store: Arc<Mutex<Option<RedisStore>>>,
+    redis_store: Arc<TokioMutex<Option<RedisStore>>>,
 }
 
 impl TradingStrategy {
@@ -56,7 +58,7 @@ impl TradingStrategy {
             executed: Arc::new(AtomicBool::new(false)),
             bought: Arc::new(AtomicBool::new(false)),
             latest_trade_info: Arc::new(Mutex::new(None)),
-            redis_store: Arc::new(Mutex::new(redis_store)),
+            redis_store: Arc::new(TokioMutex::new(redis_store)),
         })
     }
 
@@ -103,8 +105,68 @@ impl TradingStrategy {
         
         self.store_latest_trade_info(trade_info.clone());
         
+        self.start_grpc_subscription().await?;
+        
         self.monitoring_loop().await?;
 
+        Ok(())
+    }
+
+    async fn start_grpc_subscription(&self) -> Result<()> {
+        log::info!("Starting gRPC subscription...");
+        log::info!("gRPC URL: {}", self.config.grpc_url);
+        
+        let subscriber = GrpcSubscriber::new(
+            self.config.grpc_url.clone(),
+            self.config.grpc_token.clone(),
+            self.target_mint,
+        );
+        
+        let mut rx = subscriber.subscribe().await
+            .context("Failed to start gRPC subscription")?;
+        
+        let redis_store = self.redis_store.clone();
+        
+        tokio::spawn(async move {
+            log::info!("gRPC subscription task started. Waiting for transactions...");
+            
+            while let Some(update) = rx.recv().await {
+                log::debug!("Received transaction update: {:?}", update);
+                
+                let redis_store = redis_store.lock().await;
+                
+                if let Some(store) = redis_store.as_ref() {
+                    let record = TokenTradeRecord::from_transaction(
+                        &update.mint,
+                        update.token_amount,
+                        update.sol_amount,
+                        update.is_buy,
+                        &update.signature,
+                        update.blocktime_us,
+                    );
+                    
+                    match store.store_trade(&update.mint, &record).await {
+                        Ok(_) => {
+                            log::info!(
+                                "Stored trade from gRPC: mint={}, signature={}, price={:.12} SOL/token",
+                                update.mint,
+                                update.signature,
+                                record.effective_price()
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to store trade from gRPC: {}", e);
+                        }
+                    }
+                } else {
+                    log::warn!("Redis not available, cannot store trade from gRPC");
+                }
+            }
+            
+            log::warn!("gRPC subscription channel closed");
+        });
+        
+        log::info!("gRPC subscription started successfully");
         Ok(())
     }
 
@@ -153,7 +215,7 @@ impl TradingStrategy {
     }
 
     async fn get_latest_trade_price(&self, mint: &str) -> Result<Option<f64>> {
-        let redis_store = self.redis_store.lock().unwrap();
+        let redis_store = self.redis_store.lock().await;
         
         if let Some(store) = redis_store.as_ref() {
             store.get_latest_price_from_trades(mint).await
@@ -164,7 +226,7 @@ impl TradingStrategy {
     }
 
     async fn check_price_increase(&self, mint: &str) -> Result<bool> {
-        let redis_store = self.redis_store.lock().unwrap();
+        let redis_store = self.redis_store.lock().await;
         
         let store = match redis_store.as_ref() {
             Some(s) => s,
@@ -233,7 +295,7 @@ impl TradingStrategy {
         signature: &str,
         blocktime_us: i64,
     ) -> Result<()> {
-        let redis_store = self.redis_store.lock().unwrap();
+        let redis_store = self.redis_store.lock().await;
         
         if let Some(store) = redis_store.as_ref() {
             let record = TokenTradeRecord::from_transaction(

@@ -30,6 +30,8 @@ url = "2.5"
 chrono = "0.4"
 
 yellowstone-grpc-proto = { version = "5", features = ["tonic"] }
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls", "transport"] }
 prost = "0.13"
 redis = { version = "0.24", features = ["tokio-comp"] }
+bs58 = "0.5"
+tokio-stream = "0.1"
