@@ -770,7 +770,7 @@ impl Trader {
         gas_fee_strategy.set_global_fee_strategy(
             150000, 150000, 
             500000, 500000, 
-            0.001, 0.001
+            0.0001, 0.0001
         );
 
         let recent_blockhash = self.get_latest_blockhash().await
@@ -840,7 +840,7 @@ impl Trader {
         gas_fee_strategy.set_global_fee_strategy(
             150000, 150000,
             500000, 500000,
-            0.001, 0.001
+            0.0001, 0.0001
         );
 
         let recent_blockhash = self.get_latest_blockhash().await
