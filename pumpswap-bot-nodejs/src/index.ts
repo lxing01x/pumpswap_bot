@@ -15,11 +15,12 @@ async function main() {
         console.log('Initializing trading strategy...');
         const strategy = await TradingStrategy.create(config);
         
-        if (config.grpcUrl) {
-            console.log('Setting up gRPC subscription...');
+        if (config.grpcUrl || config.rpcUrl) {
+            console.log('Setting up transaction subscription...');
             const grpcSubscriber = new GrpcSubscriber({
                 grpcUrl: config.grpcUrl,
                 grpcToken: config.grpcToken,
+                rpcUrl: config.rpcUrl,
             });
             
             grpcSubscriber.addHandler(async (update) => {
