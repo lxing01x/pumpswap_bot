@@ -29,22 +29,12 @@ export class GrpcSubscriber {
         this.handlers.push(handler);
     }
 
-    private async emitUpdate(update: TransactionUpdate): Promise<void> {
-        for (const handler of this.handlers) {
-            try {
-                await Promise.resolve(handler(update));
-            } catch (e) {
-                console.error('Error in transaction handler:', e);
-            }
-        }
-    }
-
     async subscribe(): Promise<void> {
         console.log('Starting gRPC subscription...');
         console.log(`gRPC URL: ${this.config.grpcUrl}`);
         
         if (this.config.grpcToken) {
-            if (this.config.grpcToken.isEmpty) {
+            if (this.config.grpcToken.length === 0) {
                 console.warn('gRPC token is empty!');
             } else {
                 console.log(`gRPC token is configured (length: ${this.config.grpcToken.length})`);
@@ -109,7 +99,7 @@ stream.on('data', (message) => {
     signature: transactionSignature,
     blocktimeUs: blockTime * 1_000_000,
   };
-  this.emitUpdate(update);
+  this._emitUpdate(update);
 });
 
 stream.on('error', (error) => {

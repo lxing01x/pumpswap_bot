@@ -1,7 +1,6 @@
 import { ConfigLoader } from './config';
 import { TradingStrategy } from './strategy';
 import { GrpcSubscriber } from './grpcSubscriber';
-import * as path from 'path';
 
 const DEFAULT_CONFIG_PATH = 'config.json';
 
