@@ -1,0 +1,22 @@
+{
+    "grpc_url": "https://api.mainnet-beta.solana.com",
+    "rpc_url": "https://api.mainnet-beta.solana.com",
+    "grpc_token": "your_grpc_token_here",
+    "private_key": "your_base58_private_key_here",
+    "target_mint": "target_token_mint_address",
+    "buy_amount_sol": 0.01,
+    "hold_seconds": 10,
+    "slippage_bps": 500,
+    "max_retries": 5,
+    "retry_delay_ms": 1000,
+    "jito_enabled": false,
+    "jito_uuid": "your_jito_uuid_here",
+    "jito_region": "Frankfurt",
+    "redis_url": "redis://127.0.0.1/",
+    "max_trades_per_token": 1000,
+    "buy_threshold_pct": 10.0,
+    "buy_time_window_sec": 5,
+    "buy_record_count": 5,
+    "sell_profit_pct": 10.0,
+    "sell_stop_loss_pct": 5.0
+}
