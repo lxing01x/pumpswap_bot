@@ -21,11 +21,12 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@solana/web3.js": "^1.95.0",
+    "@solana/web3.js": "^1.91.0",
     "bs58": "^5.0.0",
     "ioredis": "^5.4.0",
     "dotenv": "^16.4.0",
-    "winston": "^3.13.0"
+    "winston": "^3.13.0",
+    "sol-trade-sdk": "./sol-trade-sdk-nodejs"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

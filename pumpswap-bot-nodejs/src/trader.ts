@@ -1,9 +1,31 @@
 import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { BotConfig } from './config';
+import {
+    TradeConfigBuilder,
+    SwqosConfig,
+    SwqosType,
+    SwqosRegion,
+    DexType,
+    TradeTokenType,
+    TradeBuyParams,
+    TradeSellParams,
+    findByMint,
+    getPoolV2PDA,
+    getCanonicalPoolPDA,
+    getTokenBalances,
+    PUMPSWAP_PROGRAM,
+    WSOL_TOKEN_ACCOUNT,
+    TOKEN_PROGRAM,
+    TradingClient,
+    TradeResult,
+    GasFeeStrategyConfig,
+    PumpSwapParams as PumpSwapParamsInterface,
+    DexParamEnum,
+} from 'sol-trade-sdk';
 
 export const PUMP_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
-export const PUMPSWAP_PROGRAM_ID = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
-export const WSOL_MINT = new PublicKey('So11111111111111111111111111111111111111112');
+export const PUMPSWAP_PROGRAM_ID = PUMPSWAP_PROGRAM;
+export const WSOL_MINT = WSOL_TOKEN_ACCOUNT;
 export const CANONICAL_POOL_INDEX = 0;
 
 export interface TradeInfo {
@@ -12,8 +34,8 @@ export interface TradeInfo {
     quoteMint: PublicKey;
     poolBaseTokenAccount: PublicKey;
     poolQuoteTokenAccount: PublicKey;
-    poolBaseTokenReserves: number;
-    poolQuoteTokenReserves: number;
+    poolBaseTokenReserves: bigint;
+    poolQuoteTokenReserves: bigint;
     coinCreatorVaultAta: PublicKey;
     coinCreatorVaultAuthority: PublicKey;
     baseTokenProgram: PublicKey;
@@ -37,35 +59,130 @@ export interface SellResult {
     price: number;
 }
 
-function derivePoolAuthorityAddress(mint: PublicKey): PublicKey {
-    const seeds = [Buffer.from('pool-authority'), mint.toBuffer()];
-    const [address] = PublicKey.findProgramAddressSync(seeds, PUMP_PROGRAM_ID);
-    return address;
+function parseJitoRegion(region: string): SwqosRegion {
+    switch (region.toLowerCase()) {
+        case 'frankfurt': return SwqosRegion.Frankfurt;
+        case 'newyork': return SwqosRegion.NewYork;
+        case 'tokyo': return SwqosRegion.Tokyo;
+        case 'amsterdam': return SwqosRegion.Amsterdam;
+        case 'singapore': return SwqosRegion.Singapore;
+        case 'slc': return SwqosRegion.SLC;
+        case 'london': return SwqosRegion.London;
+        case 'losangeles': return SwqosRegion.LosAngeles;
+        default: return SwqosRegion.Frankfurt;
+    }
 }
 
-function derivePumpswapPoolAddress(
-    creator: PublicKey,
-    baseMint: PublicKey,
-    quoteMint: PublicKey
-): PublicKey {
-    const index = 0;
-    const indexBytes = Buffer.alloc(2);
-    indexBytes.writeUInt16LE(index, 0);
-    
-    const seeds = [
-        Buffer.from('pool'),
-        indexBytes,
-        creator.toBuffer(),
-        baseMint.toBuffer(),
-        quoteMint.toBuffer(),
-    ];
-    const [address] = PublicKey.findProgramAddressSync(seeds, PUMPSWAP_PROGRAM_ID);
-    return address;
+function convertPoolToTradeInfo(
+    poolAddress: PublicKey,
+    pool: {
+        poolBump: number;
+        index: number;
+        creator: PublicKey;
+        baseMint: PublicKey;
+        quoteMint: PublicKey;
+        lpMint: PublicKey;
+        poolBaseTokenAccount: PublicKey;
+        poolQuoteTokenAccount: PublicKey;
+        lpSupply: bigint;
+        coinCreator: PublicKey;
+        isMayhemMode: boolean;
+        isCashbackCoin: boolean;
+    },
+    baseReserves: bigint,
+    quoteReserves: bigint
+): TradeInfo {
+    return {
+        pool: poolAddress,
+        baseMint: pool.baseMint,
+        quoteMint: pool.quoteMint,
+        poolBaseTokenAccount: pool.poolBaseTokenAccount,
+        poolQuoteTokenAccount: pool.poolQuoteTokenAccount,
+        poolBaseTokenReserves: baseReserves,
+        poolQuoteTokenReserves: quoteReserves,
+        coinCreatorVaultAta: PublicKey.default,
+        coinCreatorVaultAuthority: pool.coinCreator,
+        baseTokenProgram: TOKEN_PROGRAM,
+        quoteTokenProgram: TOKEN_PROGRAM,
+        feeRecipient: PublicKey.default,
+        isCashbackCoin: pool.isCashbackCoin,
+        isMayhemMode: pool.isMayhemMode,
+    };
 }
 
-export function deriveCanonicalPoolAddress(mint: PublicKey): PublicKey {
-    const poolAuthority = derivePoolAuthorityAddress(mint);
-    return derivePumpswapPoolAddress(poolAuthority, mint, WSOL_MINT);
+function createGasFeeStrategyConfig(): GasFeeStrategyConfig {
+    return {
+        buyPriorityFee: 150000,
+        sellPriorityFee: 150000,
+        buyComputeUnits: 500000,
+        sellComputeUnits: 500000,
+        buyTipLamports: 100000,
+        sellTipLamports: 100000,
+    };
+}
+
+function tradeInfoToPumpSwapParams(tradeInfo: TradeInfo): PumpSwapParamsInterface {
+    return {
+        pool: tradeInfo.pool,
+        baseMint: tradeInfo.baseMint,
+        quoteMint: tradeInfo.quoteMint,
+        poolBaseTokenAccount: tradeInfo.poolBaseTokenAccount,
+        poolQuoteTokenAccount: tradeInfo.poolQuoteTokenAccount,
+        poolBaseTokenReserves: Number(tradeInfo.poolBaseTokenReserves),
+        poolQuoteTokenReserves: Number(tradeInfo.poolQuoteTokenReserves),
+        coinCreatorVaultAta: tradeInfo.coinCreatorVaultAta,
+        coinCreatorVaultAuthority: tradeInfo.coinCreatorVaultAuthority,
+        baseTokenProgram: tradeInfo.baseTokenProgram,
+        quoteTokenProgram: tradeInfo.quoteTokenProgram,
+        isMayhemMode: tradeInfo.isMayhemMode,
+        isCashbackCoin: tradeInfo.isCashbackCoin,
+    };
+}
+
+function createDexParamEnum(tradeInfo: TradeInfo): DexParamEnum {
+    return {
+        type: 'PumpSwap',
+        params: tradeInfoToPumpSwapParams(tradeInfo),
+    };
+}
+
+interface RpcAdapter {
+    getAccountInfo: (pubkey: PublicKey) => Promise<{ value?: { data: Buffer } | undefined }>;
+    getProgramAccounts?: (programId: PublicKey, config?: unknown) => Promise<Array<{
+        pubkey: PublicKey;
+        account: { data: Buffer };
+    }>>;
+    getTokenAccountBalance: (pubkey: PublicKey) => Promise<{ value?: { amount: string } | undefined }>;
+}
+
+function createRpcAdapter(connection: Connection): RpcAdapter {
+    return {
+        getAccountInfo: async (pubkey: PublicKey) => {
+            const info = await connection.getAccountInfo(pubkey);
+            return { value: info || undefined };
+        },
+        getProgramAccounts: async (programId: PublicKey, config?: unknown) => {
+            const accounts = await connection.getProgramAccounts(programId, config as any);
+            if (Array.isArray(accounts)) {
+                return accounts.map((a: { pubkey: PublicKey; account: { data: Buffer } }) => ({
+                    pubkey: a.pubkey,
+                    account: { data: a.account.data },
+                }));
+            }
+            return [];
+        },
+        getTokenAccountBalance: async (pubkey: PublicKey) => {
+            const balance = await connection.getTokenAccountBalance(pubkey);
+            return { value: balance.value };
+        },
+    };
+}
+
+function tradeErrorToString(error: unknown): string {
+    if (error instanceof Error) {
+        return error.message;
+    }
+    return String(error);
 }
 
 export class Trader {
@@ -76,19 +193,50 @@ export class Trader {
     private retryDelayMs: number;
     private buyPrice: number | null = null;
     private buySolAmount: number = 0;
+    private client: TradingClient;
+    private gasFeeConfig: GasFeeStrategyConfig;
+    private rpcAdapter: RpcAdapter;
 
     constructor(
         rpcUrl: string,
         keypair: Keypair,
         slippageBps: number,
         maxRetries: number = 5,
-        retryDelayMs: number = 1000
+        retryDelayMs: number = 1000,
+        jitoEnabled: boolean = false,
+        jitoUuid?: string,
+        jitoRegion: string = 'Frankfurt'
     ) {
         this.connection = new Connection(rpcUrl, 'confirmed');
         this.keypair = keypair;
         this.slippageBps = slippageBps;
         this.maxRetries = maxRetries;
         this.retryDelayMs = retryDelayMs;
+        this.rpcAdapter = createRpcAdapter(this.connection);
+
+        const swqosConfigs: SwqosConfig[] = jitoEnabled 
+            ? [
+                {
+                    type: SwqosType.Jito,
+                    region: parseJitoRegion(jitoRegion),
+                    apiKey: jitoUuid || '',
+                }
+            ]
+            : [
+                {
+                    type: SwqosType.Default,
+                    region: SwqosRegion.Default,
+                    apiKey: '',
+                    customUrl: rpcUrl,
+                }
+            ];
+
+        const tradeConfig = TradeConfigBuilder.create(rpcUrl)
+            .swqosConfigs(swqosConfigs)
+            .build();
+
+        this.client = new TradingClient(keypair, tradeConfig);
+        this.gasFeeConfig = createGasFeeStrategyConfig();
     }
 
     static async fromConfig(config: BotConfig, keypair: Keypair): Promise<Trader> {
@@ -97,7 +245,10 @@ export class Trader {
             keypair,
             config.slippageBps,
             config.maxRetries,
-            config.retryDelayMs
+            config.retryDelayMs,
+            config.jitoEnabled,
+            config.jitoUuid,
+            config.jitoRegion
         );
     }
 
@@ -111,6 +262,10 @@ export class Trader {
 
     getPublicKey(): PublicKey {
         return this.keypair.publicKey;
+    }
+
+    getClient(): TradingClient {
+        return this.client;
     }
 
     setBuyPrice(price: number, solAmount: number): void {
@@ -142,11 +297,11 @@ export class Trader {
                 return 0;
             }
 
-            const tokenAccountInfo = await this.connection.getTokenAccountBalance(
+            const accountInfo = await this.connection.getTokenAccountBalance(
                 tokenAccounts.value[0].pubkey
             );
             
-            return Number(tokenAccountInfo.value.amount);
+            return Number(accountInfo.value.amount);
         } catch (e) {
             console.warn(`Failed to get token balance for mint ${mint.toBase58()}:`, e);
             return 0;
@@ -154,14 +309,15 @@ export class Trader {
     }
 
     calculatePriceFromPool(tradeInfo: TradeInfo): number {
-        const baseReserves = tradeInfo.poolBaseTokenReserves;
-        const quoteReserves = tradeInfo.poolQuoteTokenReserves;
+        const baseReserves = Number(tradeInfo.poolBaseTokenReserves);
+        const quoteReserves = Number(tradeInfo.poolQuoteTokenReserves);
         
         if (baseReserves === 0) {
             return 0;
         }
         
-        return quoteReserves / baseReserves;
+        const price = (quoteReserves / baseReserves) / 1000;
+        return price;
     }
 
     calculateProfitLossPct(currentPrice: number): number | null {
@@ -199,15 +355,15 @@ export class Trader {
     async diagnosePoolAddress(mint: PublicKey): Promise<void> {
         console.log('=== Diagnosing PumpSwap pool address ===');
         console.log(`Mint: ${mint.toBase58()}`);
-        console.log(`WSOL Mint: ${WSOL_MINT.toBase58()}`);
+        console.log(`WSOL Mint: ${WSOL_TOKEN_ACCOUNT.toBase58()}`);
         console.log(`Pump Program ID: ${PUMP_PROGRAM_ID.toBase58()}`);
-        console.log(`PumpSwap Program ID: ${PUMPSWAP_PROGRAM_ID.toBase58()}`);
+        console.log(`PumpSwap Program ID: ${PUMPSWAP_PROGRAM.toBase58()}`);
 
-        const poolAuthority = derivePoolAuthorityAddress(mint);
-        console.log(`Derived pool-authority address: ${poolAuthority.toBase58()}`);
+        const poolV2 = getPoolV2PDA(mint);
+        console.log(`Pool v2 PDA: ${poolV2.toBase58()}`);
 
-        const poolAddress = deriveCanonicalPoolAddress(mint);
-        console.log(`Canonical pool address: ${poolAddress.toBase58()}`);
+        const canonicalPool = getCanonicalPoolPDA(mint);
+        console.log(`Canonical pool PDA: ${canonicalPool.toBase58()}`);
 
         console.log('');
         console.log('IMPORTANT: For canonical PumpSwap pools (created via migrate instruction):');
@@ -229,39 +385,34 @@ export class Trader {
             console.log(`Attempt ${attempt + 1}/${this.maxRetries} to find and fetch pool data for mint: ${mint.toBase58()}`);
 
             try {
-                const poolAddress = deriveCanonicalPoolAddress(mint);
-                console.log(`Trying canonical pool address: ${poolAddress.toBase58()}`);
-
-                const accountInfo = await this.connection.getAccountInfo(poolAddress);
+                const result = await findByMint(this.rpcAdapter, mint);
                 
-                if (accountInfo) {
-                    console.log(`Successfully found pool on attempt ${attempt + 1}: ${poolAddress.toBase58()}`);
+                if (result) {
+                    console.log(`Successfully found pool on attempt ${attempt + 1}: ${result.poolAddress.toBase58()}`);
                     
-                    const tradeInfo: TradeInfo = {
-                        pool: poolAddress,
-                        baseMint: mint,
-                        quoteMint: WSOL_MINT,
-                        poolBaseTokenAccount: PublicKey.default,
-                        poolQuoteTokenAccount: PublicKey.default,
-                        poolBaseTokenReserves: 0,
-                        poolQuoteTokenReserves: 0,
-                        coinCreatorVaultAta: PublicKey.default,
-                        coinCreatorVaultAuthority: PublicKey.default,
-                        baseTokenProgram: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-                        quoteTokenProgram: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-                        feeRecipient: PublicKey.default,
-                        isCashbackCoin: false,
-                        isMayhemMode: false,
-                    };
+                    const balances = await getTokenBalances(this.rpcAdapter, result.pool);
+                    const baseReserves = balances?.baseBalance || 0n;
+                    const quoteReserves = balances?.quoteBalance || 0n;
 
-                    console.log('TradeInfo built:');
+                    const tradeInfo = convertPoolToTradeInfo(
+                        result.poolAddress,
+                        result.pool,
+                        baseReserves,
+                        quoteReserves
+                    );
+                    
+                    console.log('TradeInfo built from pool data:');
                     console.log(`  Pool: ${tradeInfo.pool.toBase58()}`);
                     console.log(`  Base mint: ${tradeInfo.baseMint.toBase58()}`);
                     console.log(`  Quote mint: ${tradeInfo.quoteMint.toBase58()}`);
+                    console.log(`  Pool base token reserves: ${tradeInfo.poolBaseTokenReserves}`);
+                    console.log(`  Pool quote token reserves: ${tradeInfo.poolQuoteTokenReserves}`);
+                    console.log(`  Is cashback coin: ${tradeInfo.isCashbackCoin}`);
+                    console.log(`  Is mayhem mode: ${tradeInfo.isMayhemMode}`);
 
                     return tradeInfo;
                 } else {
-                    throw new Error(`Pool account ${poolAddress.toBase58()} does not exist`);
+                    throw new Error(`No pool found for mint ${mint.toBase58()}`);
                 }
             } catch (e) {
                 console.warn(`Attempt ${attempt + 1}/${this.maxRetries} failed to find pool:`, e);
@@ -289,6 +440,7 @@ export class Trader {
         console.log(`Starting buy operation for mint: ${tradeInfo.baseMint.toBase58()}`);
         console.log(`Buy amount: ${solAmount} lamports (${solAmount / LAMPORTS_PER_SOL} SOL)`);
         console.log(`Using pool: ${tradeInfo.pool.toBase58()}`);
+        console.log(`Is cashback coin: ${tradeInfo.isCashbackCoin}`);
 
         const walletBalance = await this.getWalletBalance();
         console.log(`Wallet balance: ${walletBalance} lamports (${walletBalance / LAMPORTS_PER_SOL} SOL)`);
@@ -313,59 +465,70 @@ export class Trader {
         console.log('Wallet balance is sufficient for buy operation');
 
         const currentPrice = this.calculatePriceFromPool(tradeInfo);
-        console.log(`Current price before buy: ${currentPrice} SOL/token`);
+        console.log(`Current price before buy: ${currentPrice.toFixed(12)} SOL/token`);
 
-        console.log('NOTE: This is a placeholder implementation.');
-        console.log('To integrate the actual sol-trade-sdk-nodejs, you would:');
-        console.log('1. Create TradingClient with TradeConfig');
-        console.log('2. Build TradeBuyParams with PumpSwap extension');
-        console.log('3. Call client.buy(params)');
-        console.log('');
-        console.log('Example code structure:');
-        console.log(`
-import { TradingClient, TradeConfig, SwqosConfig, DexType, TradeBuyParams, TradeTokenType, GasFeeStrategy } from 'sol-trade-sdk';
+        const blockhashResult = await this.client.getLatestBlockhash();
+        const recentBlockhash = blockhashResult.blockhash;
 
-const swqosConfigs: SwqosConfig[] = [
-  { type: 'Default', rpcUrl: this.rpcUrl },
-  // or { type: 'Jito', uuid: 'your_uuid', region: SwqosRegion.Frankfurt }
-];
+        const extensionParams = createDexParamEnum(tradeInfo);
 
-const tradeConfig = new TradeConfig(rpcUrl, swqosConfigs);
-const client = new TradingClient(keypair, tradeConfig);
-
-const gasFeeStrategy = new GasFeeStrategy();
-gasFeeStrategy.setGlobalFeeStrategy(150000, 150000, 500000, 500000, 0.0001, 0.0001);
-
-const pumpswapParams = PumpSwapParams.from_trade(...);
-const buyParams: TradeBuyParams = {
-  dexType: DexType.PumpSwap,
-  inputTokenType: TradeTokenType.WSOL,
-  mint: mintBytes,
-  inputTokenAmount: solAmount,
-  slippageBasisPoints: this.slippageBps,
-  extensionParams: { type: 'PumpSwap', params: pumpswapParams },
-  gasFeeStrategy,
-  waitTxConfirmed: true,
-};
-
-const result = await client.buy(buyParams);
-`);
-
-        const mockSignature = 'mock_buy_signature_' + Date.now();
-        
-        this.setBuyPrice(currentPrice, solAmount);
-        console.log(`Recorded buy price: ${currentPrice} token/SOL, solAmount: ${solAmount} lamports`);
-
-        return {
-            success: true,
-            signatures: [mockSignature],
-            price: currentPrice,
+        const buyParams: TradeBuyParams = {
+            dexType: DexType.PumpSwap,
+            inputTokenType: TradeTokenType.WSOL,
+            mint: tradeInfo.baseMint,
+            inputTokenAmount: solAmount,
+            slippageBasisPoints: this.slippageBps,
+            recentBlockhash,
+            extensionParams,
+            waitTxConfirmed: true,
+            createInputTokenAta: true,
+            closeInputTokenAta: true,
+            createMintAta: true,
+            gasFeeStrategy: this.gasFeeConfig,
         };
+
+        console.log('Executing buy transaction...');
+        
+        try {
+            const result: TradeResult = await this.client.buy(buyParams);
+            
+            if (result.success && result.signatures.length > 0) {
+                const signature = result.signatures[0];
+                console.log(`Buy transaction successful! Signature: ${signature}`);
+                this.setBuyPrice(currentPrice, solAmount);
+                console.log(`Recorded buy price: ${currentPrice.toFixed(12)} SOL/token, solAmount: ${solAmount} lamports`);
+                
+                return {
+                    success: true,
+                    signatures: result.signatures,
+                    price: currentPrice,
+                };
+            } else {
+                const errorMsg = result.error ? tradeErrorToString(result.error) : 'Buy failed without error message';
+                console.error(`Buy transaction failed: ${errorMsg}`);
+                return {
+                    success: false,
+                    signatures: [],
+                    error: errorMsg,
+                    price: currentPrice,
+                };
+            }
+        } catch (e) {
+            const errorMsg = e instanceof Error ? e.message : 'Unknown error';
+            console.error(`Buy transaction error: ${errorMsg}`);
+            return {
+                success: false,
+                signatures: [],
+                error: errorMsg,
+                price: currentPrice,
+            };
+        }
     }
 
     async sell(tradeInfo: TradeInfo): Promise<SellResult> {
         console.log(`Starting sell operation for mint: ${tradeInfo.baseMint.toBase58()}`);
         console.log(`Using pool: ${tradeInfo.pool.toBase58()}`);
+        console.log(`Is cashback coin: ${tradeInfo.isCashbackCoin}`);
 
         const tokenBalance = await this.getTokenBalance(tradeInfo.baseMint);
         if (tokenBalance === 0) {
@@ -373,47 +536,62 @@ const result = await client.buy(buyParams);
         }
         console.log(`Token balance to sell: ${tokenBalance}`);
 
+        const blockhashResult = await this.client.getLatestBlockhash();
+        const recentBlockhash = blockhashResult.blockhash;
+
+        const extensionParams = createDexParamEnum(tradeInfo);
+
         const currentPrice = this.calculatePriceFromPool(tradeInfo);
-        console.log(`Current price before sell: ${currentPrice} SOL/token`);
+        console.log(`Current price before sell: ${currentPrice.toFixed(12)} SOL/token`);
 
-        console.log('NOTE: This is a placeholder implementation.');
-        console.log('To integrate the actual sol-trade-sdk-nodejs, you would:');
-        console.log('1. Create TradingClient with TradeConfig');
-        console.log('2. Build TradeSellParams with PumpSwap extension');
-        console.log('3. Call client.sell(params)');
-        console.log('');
-        console.log('Example code structure:');
-        console.log(`
-import { TradingClient, TradeConfig, SwqosConfig, DexType, TradeSellParams, TradeTokenType, GasFeeStrategy } from 'sol-trade-sdk';
-
-const tradeConfig = new TradeConfig(rpcUrl, swqosConfigs);
-const client = new TradingClient(keypair, tradeConfig);
-
-const gasFeeStrategy = new GasFeeStrategy();
-gasFeeStrategy.setGlobalFeeStrategy(150000, 150000, 500000, 500000, 0.0001, 0.0001);
-
-const pumpswapParams = PumpSwapParams.from_trade(...);
-const sellParams: TradeSellParams = {
-  dexType: DexType.PumpSwap,
-  outputTokenType: TradeTokenType.WSOL,
-  mint: mintBytes,
-  inputTokenAmount: tokenBalance,
-  slippageBasisPoints: this.slippageBps,
-  extensionParams: { type: 'PumpSwap', params: pumpswapParams },
-  gasFeeStrategy,
-  waitTxConfirmed: true,
-  closeMintTokenAta: true,
-};
-
-const result = await client.sell(sellParams);
-`);
-
-        const mockSignature = 'mock_sell_signature_' + Date.now();
-
-        return {
-            success: true,
-            signatures: [mockSignature],
-            price: currentPrice,
+        const sellParams: TradeSellParams = {
+            dexType: DexType.PumpSwap,
+            outputTokenType: TradeTokenType.WSOL,
+            mint: tradeInfo.baseMint,
+            inputTokenAmount: tokenBalance,
+            slippageBasisPoints: this.slippageBps,
+            recentBlockhash,
+            extensionParams,
+            waitTxConfirmed: true,
+            createOutputTokenAta: true,
+            closeOutputTokenAta: true,
+            closeMintTokenAta: true,
+            gasFeeStrategy: this.gasFeeConfig,
         };
+
+        console.log('Executing sell transaction...');
+        
+        try {
+            const result: TradeResult = await this.client.sell(sellParams);
+            
+            if (result.success && result.signatures.length > 0) {
+                const signature = result.signatures[0];
+                console.log(`Sell transaction successful! Signature: ${signature}`);
+                
+                return {
+                    success: true,
+                    signatures: result.signatures,
+                    price: currentPrice,
+                };
+            } else {
+                const errorMsg = result.error ? tradeErrorToString(result.error) : 'Sell failed without error message';
+                console.error(`Sell transaction failed: ${errorMsg}`);
+                return {
+                    success: false,
+                    signatures: [],
+                    error: errorMsg,
+                    price: currentPrice,
+                };
+            }
+        } catch (e) {
+            const errorMsg = e instanceof Error ? e.message : 'Unknown error';
+            console.error(`Sell transaction error: ${errorMsg}`);
+            return {
+                success: false,
+                signatures: [],
+                error: errorMsg,
+                price: currentPrice,
+            };
+        }
     }
 }

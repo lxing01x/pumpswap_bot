@@ -1,7 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import { BotConfig, ConfigLoader } from './config';
 import { Trader, TradeInfo } from './trader';
-import { RedisStore, TokenTradeRecord } from './redisStore';
+import { RedisStore } from './redisStore';
 import { TradeRecorder } from './tradeRecorder';
 
 export interface TokenPosition {
